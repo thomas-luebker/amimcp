@@ -51,7 +51,7 @@ gone wrong.
 
 ### Download the release
 
-Grab [`amiagent-0.2.0.lha`](https://github.com/thomas-luebker/amimcp/releases/latest)
+Grab [`amiagent-0.3.0.lha`](https://github.com/thomas-luebker/amimcp/releases/latest)
 and unpack it on the Amiga. It contains `amiagent` (68000, runs on everything)
 and `amiagent.020` (68020+).
 
