@@ -48,11 +48,20 @@ gone wrong.
 
 ## 1. Install the agent on the Amiga
 
+### Download the release
+
+Grab [`amiagent-0.2.0.lha`](https://github.com/thomas-luebker/amimcp/releases/latest)
+and unpack it on the Amiga. It contains `amiagent` (68000, runs on everything)
+and `amiagent.020` (68020+).
+
 ### With [amipkg](https://github.com/thomas-luebker/amipkg)
 
 ```
 amipkg install amiagent
 ```
+
+*Pending — the catalog entry is submitted but not yet merged and signed.
+Use the release download until then.*
 
 ### Or build it yourself
 
