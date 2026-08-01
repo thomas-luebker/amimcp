@@ -51,7 +51,7 @@ gone wrong.
 
 ### Download the release
 
-Grab [`amiagent-0.3.0.lha`](https://github.com/thomas-luebker/amimcp/releases/latest)
+Grab [`amiagent-0.3.1.lha`](https://github.com/thomas-luebker/amimcp/releases/latest)
 and unpack it on the Amiga. It contains `amiagent` (68000, runs on everything)
 and `amiagent.020` (68020+).
 
@@ -60,9 +60,6 @@ and `amiagent.020` (68020+).
 ```
 amipkg install amiagent
 ```
-
-*Pending — the catalog entry is submitted but not yet merged and signed.
-Use the release download until then.*
 
 ### Or build it yourself
 
