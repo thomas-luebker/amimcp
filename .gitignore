@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Built Amiga binary — produced by `make` in agent/
+agent/amiagent
+
+# Release archives
+dist/

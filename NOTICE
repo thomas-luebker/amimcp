@@ -1,0 +1,17 @@
+amimcp — an MCP server that gives Claude hands on a real Amiga
+Copyright 2026 Thomas Luebker <thomas@amiga-imager.com>
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Vendored components keep their own licenses:
+
+  agent/vendor/cgx/
+      CyberGraphX SDK interface definitions — the cybergraphics.library
+      function-definition file and its C headers.
+      Copyright 1996-1998 phase5 digital products.
+      Redistributed as the SDK's interface files, which phase5 published for
+      exactly this purpose: writing software that calls the library. No
+      library code is included, only the declarations needed to call it.
+      inline/cybergraphics.h is generated from cybergraphics_lib.fd by
+      fd2pragma (Dirk Stoecker), and can be regenerated at any time — see
+      agent/vendor/cgx/README.md.

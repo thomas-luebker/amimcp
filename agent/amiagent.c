@@ -1,0 +1,1109 @@
+/*
+ * amiagent - the Amiga half of amimcp.
+ *
+ * A small TCP daemon that lets a remote MCP server run AmigaDOS commands,
+ * move files, list directories, read system state, and grab the screen on
+ * this machine's behalf. Speaks the framed protocol in ../PROTOCOL.md.
+ *
+ * Targets AmigaOS 2.04 and up on a bare 68000. That constraint drives most of
+ * the shape of this file: no dynamic string library, no recursion, payloads
+ * streamed through a fixed 8 KiB buffer rather than held in RAM, and one
+ * connection served at a time.
+ *
+ * SECURITY: this runs arbitrary commands for anyone who can reach the port.
+ * Start it with a TOKEN and keep it on a LAN you trust. See PROTOCOL.md.
+ */
+
+#ifndef __amigaos__
+#error "amiagent targets AmigaOS - build with m68k-amigaos-gcc (see Makefile)"
+#endif
+
+/* The NDK's sys/socket.h uses ssize_t, but newlib gates its typedef behind a
+ * feature macro that isn't active here. Define it (with newlib's own guard, so
+ * this stays conflict-free) BEFORE proto/bsdsocket.h pulls socket.h in. This
+ * is the same dance amipkg's http.c does. */
+#include <sys/types.h>
+#ifndef _SSIZE_T_DECLARED
+typedef long ssize_t;
+#define _SSIZE_T_DECLARED
+#endif
+
+#include <exec/types.h>
+#include <exec/memory.h>
+#include <dos/dos.h>
+#include <dos/dostags.h>
+#include <dos/datetime.h>
+#include <exec/io.h>
+#include <devices/input.h>
+#include <devices/inputevent.h>
+#include <intuition/intuition.h>
+#include <intuition/intuitionbase.h>
+#include <graphics/gfxbase.h>
+#include <cybergraphx/cybergraphics.h>
+
+#include <proto/exec.h>
+#include <proto/dos.h>
+#include <proto/intuition.h>
+#include <proto/graphics.h>
+#include <proto/keymap.h>
+#include <inline/cybergraphics.h>
+#include <proto/bsdsocket.h>
+
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "proto.h"
+
+struct Library *SocketBase = NULL;
+/* Opened on demand: only truecolor screens need it, and plenty of Amigas do
+ * not have it at all. */
+struct Library *CyberGfxBase = NULL;
+
+/* bebbo's startup auto-opens intuition.library and graphics.library when the
+ * linker pulls in a reference to them, so IntuitionBase/GfxBase are already
+ * live here. If your toolchain does NOT auto-open them the link will fail with
+ * an undefined IntuitionBase (or the screenshot path will find it NULL) —
+ * build with -DAMIAGENT_OWN_LIBBASES to open and close them by hand instead. */
+#ifdef AMIAGENT_OWN_LIBBASES
+struct IntuitionBase *IntuitionBase = NULL;
+struct GfxBase *GfxBase = NULL;
+#endif
+
+#define IOBUF 8192
+
+static UBYTE g_io[IOBUF];
+static char g_token[128];
+static int g_have_token = 0;
+static int g_quiet = 0;
+
+static void say(const char *fmt, ...)
+{
+    va_list ap;
+    if (g_quiet) return;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    fflush(stdout);
+}
+
+/* ------------------------------------------------------------------ *
+ * Socket helpers
+ * ------------------------------------------------------------------ */
+
+/* Wait until `sock` is readable. Returns 1 ready, 0 timed out, -1 on Ctrl-C or
+ * error. Going through WaitSelect rather than a blocking recv() is what keeps
+ * Ctrl-C able to stop the daemon while it is parked waiting for a client. */
+static int sock_readable(int sock, long secs)
+{
+    fd_set rd;
+    struct timeval tv;
+    ULONG sigs = SIGBREAKF_CTRL_C;
+    LONG n;
+
+    FD_ZERO(&rd);
+    FD_SET(sock, &rd);
+    tv.tv_sec = secs;
+    tv.tv_usec = 0;
+
+    n = WaitSelect(sock + 1, &rd, NULL, NULL, secs < 0 ? NULL : &tv, &sigs);
+    if (sigs & SIGBREAKF_CTRL_C) return -1;
+    if (n < 0) return -1;
+    if (n == 0) return 0;
+    return FD_ISSET(sock, &rd) ? 1 : 0;
+}
+
+/* Read exactly len bytes. Returns 1 on success, 0 on EOF/error/break. */
+static int recv_all(int sock, UBYTE *buf, ULONG len)
+{
+    while (len) {
+        long got;
+        int r = sock_readable(sock, 120);
+        if (r <= 0) return 0;
+        got = recv(sock, (char *)buf, (int)(len > 0x7000 ? 0x7000 : len), 0);
+        if (got <= 0) return 0;
+        buf += got;
+        len -= (ULONG)got;
+    }
+    return 1;
+}
+
+static int send_all(int sock, const UBYTE *buf, ULONG len)
+{
+    while (len) {
+        long put = send(sock, (char *)buf, (int)(len > 0x7000 ? 0x7000 : len), 0);
+        if (put <= 0) return 0;
+        buf += put;
+        len -= (ULONG)put;
+    }
+    return 1;
+}
+
+static void put_be32(UBYTE *p, ULONG v)
+{
+    p[0] = (UBYTE)(v >> 24); p[1] = (UBYTE)(v >> 16);
+    p[2] = (UBYTE)(v >> 8);  p[3] = (UBYTE)v;
+}
+
+static ULONG get_be32(const UBYTE *p)
+{
+    return ((ULONG)p[0] << 24) | ((ULONG)p[1] << 16) |
+           ((ULONG)p[2] << 8) | (ULONG)p[3];
+}
+
+static void put_be16(UBYTE *p, UWORD v)
+{
+    p[0] = (UBYTE)(v >> 8); p[1] = (UBYTE)v;
+}
+
+/* Send a response header. The body follows in as many send_all() calls as the
+ * handler likes, which is what lets GET stream a file it never fully holds. */
+static int send_hdr(int sock, UBYTE status, ULONG len)
+{
+    UBYTE h[AMI_HDRLEN];
+    h[0] = AMI_MAGIC0; h[1] = AMI_MAGIC1; h[2] = AMI_MAGIC2; h[3] = AMI_MAGIC3;
+    h[4] = status;
+    h[5] = 0; h[6] = 0; h[7] = 0;
+    put_be32(h + 8, len);
+    return send_all(sock, h, AMI_HDRLEN);
+}
+
+static int send_resp(int sock, UBYTE status, const void *payload, ULONG len)
+{
+    if (!send_hdr(sock, status, len)) return 0;
+    if (len && !send_all(sock, (const UBYTE *)payload, len)) return 0;
+    return 1;
+}
+
+static int send_err(int sock, const char *msg)
+{
+    return send_resp(sock, ST_ERR, msg, (ULONG)strlen(msg));
+}
+
+/* ------------------------------------------------------------------ *
+ * Growable byte buffer (directory listings, sysinfo)
+ * ------------------------------------------------------------------ */
+
+struct buf {
+    UBYTE *p;
+    ULONG len;
+    ULONG cap;
+};
+
+static void buf_init(struct buf *b) { b->p = NULL; b->len = b->cap = 0; }
+static void buf_free(struct buf *b) { if (b->p) FreeVec(b->p); buf_init(b); }
+
+static int buf_add(struct buf *b, const void *data, ULONG n)
+{
+    if (b->len + n > b->cap) {
+        ULONG ncap = b->cap ? b->cap * 2 : 4096;
+        UBYTE *np;
+        while (ncap < b->len + n) ncap *= 2;
+        np = (UBYTE *)AllocVec(ncap, MEMF_ANY);
+        if (!np) return 0;
+        if (b->len) CopyMem(b->p, np, b->len);
+        if (b->p) FreeVec(b->p);
+        b->p = np;
+        b->cap = ncap;
+    }
+    CopyMem((APTR)data, b->p + b->len, n);
+    b->len += n;
+    return 1;
+}
+
+static int buf_str(struct buf *b, const char *s)
+{
+    return buf_add(b, s, (ULONG)strlen(s));
+}
+
+/* ------------------------------------------------------------------ *
+ * Command handlers
+ * ------------------------------------------------------------------ */
+
+/* Copy a length-delimited (not NUL-terminated) payload into a C string. */
+static char *dup_cstr(const UBYTE *p, ULONG len)
+{
+    char *s = (char *)AllocVec(len + 1, MEMF_ANY);
+    if (!s) return NULL;
+    if (len) CopyMem((APTR)p, s, len);
+    s[len] = '\0';
+    return s;
+}
+
+static int do_ping(int sock)
+{
+    char msg[160];
+    sprintf(msg, "amiagent %s  AmigaOS dos.library %ld\n",
+            AMIAGENT_VERSION, (long)((struct Library *)DOSBase)->lib_Version);
+    return send_resp(sock, ST_OK, msg, (ULONG)strlen(msg));
+}
+
+/* Run an AmigaDOS command, capturing stdout to a temp file, then stream the
+ * file back after the 4-byte return code.
+ *
+ * The handles we pass are OURS to close. The dos.library autodoc is explicit:
+ * "[they] will not be closed by System, you must close them (if needed) after
+ * System returns". Getting that backwards leaves the output file open, so it
+ * reads back empty AND stays locked, wedging every later command.
+ *
+ * stderr is captured too where the OS supports it: SYS_Error arrived in
+ * dos.library v47 (AmigaOS 3.2). Older systems silently get stdout only. */
+
+/* Size of an open file, or 0. Seek-to-end returns the OLD position, so the
+ * second Seek is what actually reports the length. */
+static ULONG file_size(BPTR fh)
+{
+    LONG end;
+    if (!fh) return 0;
+    if (Seek(fh, 0, OFFSET_END) < 0) return 0;
+    end = Seek(fh, 0, OFFSET_BEGINNING);
+    return end > 0 ? (ULONG)end : 0;
+}
+
+/* Stream `len` bytes of `fh` to the socket. */
+static int pump(int sock, BPTR fh, ULONG len)
+{
+    while (len) {
+        LONG n = Read(fh, g_io, (LONG)(len > IOBUF ? IOBUF : len));
+        if (n <= 0) return 0;
+        if (!send_all(sock, g_io, (ULONG)n)) return 0;
+        len -= (ULONG)n;
+    }
+    return 1;
+}
+
+static const char ERRMARK[] = "\n--- stderr ---\n";
+
+static int do_exec(int sock, const UBYTE *payload, ULONG len)
+{
+    char outname[64], errname[64];
+    char *cmd;
+    BPTR out, in, err = 0, fo = 0, fe = 0;
+    LONG rc;
+    ULONG outlen = 0, errlen = 0, marklen = 0;
+    UBYTE rcbuf[4];
+    int have_err = (((struct Library *)DOSBase)->lib_Version >= 47);
+    int ok = 0;
+
+    cmd = dup_cstr(payload, len);
+    if (!cmd) return send_err(sock, "out of memory");
+
+    sprintf(outname, "T:amiagent-%08lx.out", (unsigned long)FindTask(NULL));
+    sprintf(errname, "T:amiagent-%08lx.err", (unsigned long)FindTask(NULL));
+
+    out = Open((STRPTR)outname, MODE_NEWFILE);
+    if (!out) { FreeVec(cmd); return send_err(sock, "cannot open T: for command output"); }
+    in = Open((STRPTR)"NIL:", MODE_OLDFILE);
+    if (!in) { Close(out); DeleteFile((STRPTR)outname); FreeVec(cmd);
+               return send_err(sock, "cannot open NIL:"); }
+    if (have_err) err = Open((STRPTR)errname, MODE_NEWFILE);
+
+    say("exec: %s\n", cmd);
+
+    rc = SystemTags((STRPTR)cmd,
+                    SYS_Input, (ULONG)in,
+                    SYS_Output, (ULONG)out,
+                    err ? SYS_Error : TAG_IGNORE, (ULONG)err,
+                    TAG_DONE);
+    FreeVec(cmd);
+
+    /* Ours to close — and closing is also what flushes them to disk. */
+    Close(in);
+    Close(out);
+    if (err) Close(err);
+
+    if (rc == -1) {
+        DeleteFile((STRPTR)outname);
+        if (have_err) DeleteFile((STRPTR)errname);
+        return send_err(sock, "could not launch command (not found, or no memory)");
+    }
+
+    fo = Open((STRPTR)outname, MODE_OLDFILE);
+    outlen = file_size(fo);
+    if (have_err) {
+        fe = Open((STRPTR)errname, MODE_OLDFILE);
+        errlen = file_size(fe);
+        if (errlen) marklen = sizeof ERRMARK - 1;
+    }
+
+    put_be32(rcbuf, (ULONG)rc);
+    if (send_hdr(sock, ST_OK, 4 + outlen + marklen + errlen) &&
+        send_all(sock, rcbuf, 4)) {
+        ok = 1;
+        if (outlen && !pump(sock, fo, outlen)) ok = 0;
+        if (ok && errlen) {
+            if (!send_all(sock, (const UBYTE *)ERRMARK, marklen)) ok = 0;
+            else if (!pump(sock, fe, errlen)) ok = 0;
+        }
+    }
+
+    if (fo) Close(fo);
+    if (fe) Close(fe);
+    DeleteFile((STRPTR)outname);
+    if (have_err) DeleteFile((STRPTR)errname);
+    return ok;
+}
+
+static int do_get(int sock, const UBYTE *payload, ULONG len)
+{
+    char *path = dup_cstr(payload, len);
+    BPTR fh;
+    ULONG size = 0;
+    int ok = 1;
+
+    if (!path) return send_err(sock, "out of memory");
+
+    fh = Open((STRPTR)path, MODE_OLDFILE);
+    if (!fh) {
+        char msg[300];
+        sprintf(msg, "cannot open \"%s\" for reading (DOS error %ld)",
+                path, (long)IoErr());
+        FreeVec(path);
+        return send_err(sock, msg);
+    }
+    FreeVec(path);
+
+    size = file_size(fh);
+    if (size > AMI_MAXFRAME) {
+        Close(fh);
+        return send_err(sock, "file is larger than the 16 MiB frame limit");
+    }
+
+    if (!send_hdr(sock, ST_OK, size)) { Close(fh); return 0; }
+    ok = pump(sock, fh, size);
+    Close(fh);
+    return ok;
+}
+
+/* PUT streams straight to disk: the frame body is consumed IOBUF bytes at a
+ * time, so pushing a 4 MB binary at a 2 MB A500 works. */
+static int do_put(int sock, const UBYTE *head, ULONG headlen, ULONG total)
+{
+    UWORD pathlen;
+    char *path;
+    BPTR fh;
+    ULONG remaining;
+    int ok = 1;
+
+    if (headlen < 2) return send_err(sock, "PUT payload too short");
+    pathlen = (UWORD)((head[0] << 8) | head[1]);
+    if ((ULONG)pathlen + 2 > headlen) return send_err(sock, "PUT path exceeds prefetched header");
+
+    path = dup_cstr(head + 2, pathlen);
+    if (!path) return send_err(sock, "out of memory");
+
+    fh = Open((STRPTR)path, MODE_NEWFILE);
+    if (!fh) {
+        char msg[300];
+        sprintf(msg, "cannot open \"%s\" for writing (DOS error %ld)",
+                path, (long)IoErr());
+        FreeVec(path);
+        return send_err(sock, msg);
+    }
+    say("put: %s\n", path);
+    FreeVec(path);
+
+    /* Whatever of the body we already have buffered goes out first... */
+    if (headlen > (ULONG)pathlen + 2) {
+        ULONG have = headlen - (pathlen + 2);
+        if (Write(fh, (APTR)(head + 2 + pathlen), (LONG)have) != (LONG)have) ok = 0;
+    }
+    /* ...then the rest streams from the socket. */
+    remaining = total - headlen;
+    while (ok && remaining) {
+        ULONG want = remaining > IOBUF ? IOBUF : remaining;
+        if (!recv_all(sock, g_io, want)) { ok = 0; break; }
+        if (Write(fh, g_io, (LONG)want) != (LONG)want) { ok = 0; break; }
+        remaining -= want;
+    }
+    Close(fh);
+
+    if (!ok) return send_err(sock, "write failed (disk full or connection lost)");
+    return send_resp(sock, ST_OK, NULL, 0);
+}
+
+static void fmt_protection(ULONG prot, char *out)
+{
+    /* h s p a are set-means-yes; r w e d are set-means-DENIED.
+     * Bit 7 is what List renders as 'h'; NDK 3.2 spells the constant
+     * FIBF_HOLD (older headers called the same bit FIBF_HIDDEN). */
+    out[0] = (prot & FIBF_HOLD)    ? 'h' : '-';
+    out[1] = (prot & FIBF_SCRIPT)  ? 's' : '-';
+    out[2] = (prot & FIBF_PURE)    ? 'p' : '-';
+    out[3] = (prot & FIBF_ARCHIVE) ? 'a' : '-';
+    out[4] = (prot & FIBF_READ)    ? '-' : 'r';
+    out[5] = (prot & FIBF_WRITE)   ? '-' : 'w';
+    out[6] = (prot & FIBF_EXECUTE) ? '-' : 'e';
+    out[7] = (prot & FIBF_DELETE)  ? '-' : 'd';
+    out[8] = '\0';
+}
+
+static int do_list(int sock, const UBYTE *payload, ULONG len)
+{
+    char *path = dup_cstr(payload, len);
+    BPTR lock;
+    struct FileInfoBlock *fib;
+    struct buf b;
+    int ok;
+
+    if (!path) return send_err(sock, "out of memory");
+
+    lock = Lock((STRPTR)path, ACCESS_READ);
+    if (!lock) {
+        char msg[300];
+        sprintf(msg, "cannot lock \"%s\" (DOS error %ld)", path, (long)IoErr());
+        FreeVec(path);
+        return send_err(sock, msg);
+    }
+    FreeVec(path);
+
+    fib = (struct FileInfoBlock *)AllocDosObject(DOS_FIB, NULL);
+    if (!fib) { UnLock(lock); return send_err(sock, "out of memory"); }
+
+    if (!Examine(lock, fib)) {
+        FreeDosObject(DOS_FIB, fib);
+        UnLock(lock);
+        return send_err(sock, "Examine() failed");
+    }
+    if (fib->fib_DirEntryType <= 0) {
+        FreeDosObject(DOS_FIB, fib);
+        UnLock(lock);
+        return send_err(sock, "path is a file, not a directory");
+    }
+
+    buf_init(&b);
+    ok = 1;
+    while (ExNext(lock, fib)) {
+        char line[512], prot[9], sday[LEN_DATSTRING], sdate[LEN_DATSTRING], stime[LEN_DATSTRING];
+        struct DateTime dt;
+
+        fmt_protection((ULONG)fib->fib_Protection, prot);
+
+        dt.dat_Stamp = fib->fib_Date;
+        dt.dat_Format = FORMAT_DOS;
+        dt.dat_Flags = 0;
+        dt.dat_StrDay = (STRPTR)sday;
+        dt.dat_StrDate = (STRPTR)sdate;
+        dt.dat_StrTime = (STRPTR)stime;
+        if (!DateToStr(&dt)) { sdate[0] = '\0'; stime[0] = '\0'; }
+
+        sprintf(line, "%c\t%ld\t%s\t%s %s\t%s\n",
+                fib->fib_DirEntryType > 0 ? 'D' : 'F',
+                (long)fib->fib_Size, prot, sdate, stime, fib->fib_FileName);
+        if (!buf_str(&b, line)) { ok = 0; break; }
+    }
+
+    FreeDosObject(DOS_FIB, fib);
+    UnLock(lock);
+
+    if (!ok) { buf_free(&b); return send_err(sock, "out of memory building listing"); }
+    ok = send_resp(sock, ST_OK, b.p, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+static int do_info(int sock)
+{
+    struct buf b;
+    char line[256];
+    struct ExecBase *sb = SysBase;
+    int ok = 1;
+    BPTR lock;
+    struct DosList *dl;
+
+    buf_init(&b);
+
+    sprintf(line, "agent=amiagent %s\n", AMIAGENT_VERSION); ok &= buf_str(&b, line);
+    sprintf(line, "kickstart=%ld.%ld\n", (long)sb->LibNode.lib_Version,
+            (long)sb->LibNode.lib_Revision); ok &= buf_str(&b, line);
+    sprintf(line, "dos.library=%ld\n",
+            (long)((struct Library *)DOSBase)->lib_Version); ok &= buf_str(&b, line);
+
+    {
+        ULONG af = sb->AttnFlags;
+        const char *cpu = "68000";
+        if (af & AFF_68060) cpu = "68060";
+        else if (af & AFF_68040) cpu = "68040";
+        else if (af & AFF_68030) cpu = "68030";
+        else if (af & AFF_68020) cpu = "68020";
+        else if (af & AFF_68010) cpu = "68010";
+        sprintf(line, "cpu=%s\n", cpu); ok &= buf_str(&b, line);
+        sprintf(line, "fpu=%s\n", (af & (AFF_68882 | AFF_68881)) ? "yes" : "no");
+        ok &= buf_str(&b, line);
+    }
+
+    sprintf(line, "chipram_free=%lu\n", (unsigned long)AvailMem(MEMF_CHIP));
+    ok &= buf_str(&b, line);
+    sprintf(line, "fastram_free=%lu\n", (unsigned long)AvailMem(MEMF_FAST));
+    ok &= buf_str(&b, line);
+    sprintf(line, "largest_free=%lu\n", (unsigned long)AvailMem(MEMF_ANY | MEMF_LARGEST));
+    ok &= buf_str(&b, line);
+
+    /* Mounted volumes, straight off the DOS list. */
+    ok &= buf_str(&b, "volumes=");
+    dl = LockDosList(LDF_VOLUMES | LDF_READ);
+    if (dl) {
+        int first = 1;
+        while ((dl = NextDosEntry(dl, LDF_VOLUMES | LDF_READ))) {
+            UBYTE *bn = (UBYTE *)BADDR(dl->dol_Name);
+            if (bn && bn[0]) {
+                char name[64];
+                int n = bn[0] < 60 ? bn[0] : 60;
+                CopyMem(bn + 1, name, n);
+                name[n] = '\0';
+                if (!first) ok &= buf_str(&b, ",");
+                ok &= buf_str(&b, name);
+                first = 0;
+            }
+        }
+        UnLockDosList(LDF_VOLUMES | LDF_READ);
+    }
+    ok &= buf_str(&b, "\n");
+
+    /* Current directory, so a caller knows where relative paths land. */
+    lock = Lock((STRPTR)"", ACCESS_READ);
+    if (lock) {
+        char cwd[256];
+        if (NameFromLock(lock, (STRPTR)cwd, sizeof cwd)) {
+            sprintf(line, "cwd=%s\n", cwd);
+            ok &= buf_str(&b, line);
+        }
+        UnLock(lock);
+    }
+
+#ifndef AMIAGENT_OWN_LIBBASES
+    if (GfxBase) {
+        sprintf(line, "graphics.library=%ld\n",
+                (long)((struct Library *)GfxBase)->lib_Version);
+        ok &= buf_str(&b, line);
+    }
+#endif
+
+    if (!ok) { buf_free(&b); return send_err(sock, "out of memory building sysinfo"); }
+    ok = send_resp(sock, ST_OK, b.p, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+/* ------------------------------------------------------------------ *
+ * Screenshot
+ * ------------------------------------------------------------------ */
+
+/* Truecolor/RTG capture through cybergraphics.library, which Picasso96 and
+ * CyberGraphX both provide. The library isn't in NDK 3.2, so the inline header
+ * under vendor/cgx is generated by fd2pragma from the CyberGraphX SDK's own
+ * .fd file — the offsets are the SDK's, not guesses.
+ *
+ * RECTFMT_RGB gives packed 24-bit RGB, which is already the wire format, so
+ * there is nothing to repack. */
+static int shot_truecolor(int sock, struct RastPort *rp, UWORD w, UWORD h)
+{
+    ULONG rowbytes = (ULONG)w * 3UL;
+    ULONG pixbytes = rowbytes * (ULONG)h;
+    UBYTE *pix, hdr[8];
+    int ok = 0;
+
+    if (!CyberGfxBase)
+        CyberGfxBase = OpenLibrary((STRPTR)"cybergraphics.library", 40);
+    if (!CyberGfxBase)
+        return send_err(sock,
+            "this is a truecolor screen and cybergraphics.library v40+ is not "
+            "available, so it cannot be captured");
+
+    if (8 + pixbytes > AMI_MAXFRAME)
+        return send_err(sock, "screen is too large for the 16 MiB frame limit");
+
+    pix = (UBYTE *)AllocVec(pixbytes, MEMF_ANY);
+    if (!pix) return send_err(sock, "not enough memory for the screen buffer");
+
+    if (ReadPixelArray(pix, 0, 0, (UWORD)rowbytes, rp, 0, 0, w, h, RECTFMT_RGB) == 0) {
+        FreeVec(pix);
+        return send_err(sock, "cybergraphics ReadPixelArray() failed");
+    }
+
+    hdr[0] = SHOT_RGB24;
+    hdr[1] = 0;
+    put_be16(hdr + 2, w);
+    put_be16(hdr + 4, h);
+    put_be16(hdr + 6, 0);   /* no palette */
+
+    say("shot: %ldx%ld truecolor\n", (long)w, (long)h);
+    if (send_hdr(sock, ST_OK, 8 + pixbytes) &&
+        send_all(sock, hdr, 8) &&
+        send_all(sock, pix, pixbytes))
+        ok = 1;
+
+    FreeVec(pix);
+    return ok;
+}
+
+/* Grab the frontmost screen. Planar screens (depth <= 8) come back as palette
+ * + chunky via ReadPixelArray8; RTG/truecolor goes through cybergraphics.
+ * PNG encoding happens on the Mac — zlib has no business on a 68000. */
+static int do_shot(int sock)
+{
+    struct Screen *scr;
+    struct RastPort *rp, temprp;
+    struct BitMap *tempbm = NULL;
+    UWORD w, h, depth;
+    ULONG stride, pixbytes, palbytes, total;
+    UBYTE *pix = NULL, hdr[8];
+    UWORD ncolors = 0;
+    UBYTE pal[256 * 3];
+    int ok = 0;
+
+#ifdef AMIAGENT_OWN_LIBBASES
+    if (!IntuitionBase)
+        IntuitionBase = (struct IntuitionBase *)OpenLibrary((STRPTR)"intuition.library", 37);
+    if (!GfxBase)
+        GfxBase = (struct GfxBase *)OpenLibrary((STRPTR)"graphics.library", 39);
+#endif
+    if (!IntuitionBase || !GfxBase)
+        return send_err(sock, "intuition.library/graphics.library unavailable");
+    if (((struct Library *)GfxBase)->lib_Version < 39)
+        return send_err(sock, "screenshots need graphics.library v39+ (OS 3.0)");
+
+    /* FirstScreen is the frontmost one, which is what you actually want to
+     * look at when something has gone wrong. */
+    Forbid();
+    scr = IntuitionBase->FirstScreen;
+    Permit();
+    if (!scr) return send_err(sock, "no screen open");
+
+    rp = &scr->RastPort;
+    w = scr->Width;
+    h = scr->Height;
+    depth = (UWORD)GetBitMapAttr(rp->BitMap, BMA_DEPTH);
+
+    if (depth > 8)
+        return shot_truecolor(sock, rp, w, h);
+
+    /* ReadPixelArray8 wants rows padded out to a multiple of 16 pixels. */
+    stride = ((ULONG)w + 15UL) & ~15UL;
+    pix = (UBYTE *)AllocVec(stride * (ULONG)h, MEMF_ANY);
+    if (!pix) return send_err(sock, "not enough memory for the screen buffer");
+
+    tempbm = AllocBitMap(stride, 1, 8, 0, NULL);
+    if (!tempbm) { FreeVec(pix); return send_err(sock, "not enough memory for the temp bitmap"); }
+
+    temprp = *rp;
+    temprp.Layer = NULL;
+    temprp.BitMap = tempbm;
+
+    if (ReadPixelArray8(rp, 0, 0, w - 1, h - 1, pix, &temprp) == -1) {
+        FreeBitMap(tempbm);
+        FreeVec(pix);
+        return send_err(sock, "ReadPixelArray8() failed");
+    }
+    FreeBitMap(tempbm);
+
+    /* Repack from the padded stride down to exactly `w` bytes per row. The
+     * destination offset is always <= the source offset, so a forward copy is
+     * safe even though the regions overlap. */
+    if (stride != (ULONG)w) {
+        UWORD y;
+        for (y = 1; y < h; y++)
+            memmove(pix + (ULONG)y * w, pix + (ULONG)y * stride, w);
+    }
+    pixbytes = (ULONG)w * (ULONG)h;
+
+    ncolors = (UWORD)(1U << depth);
+    if (ncolors > 256) ncolors = 256;
+    {
+        UWORD i;
+        ULONG rgb[3];
+        for (i = 0; i < ncolors; i++) {
+            GetRGB32(scr->ViewPort.ColorMap, i, 1, rgb);
+            pal[i * 3 + 0] = (UBYTE)(rgb[0] >> 24);
+            pal[i * 3 + 1] = (UBYTE)(rgb[1] >> 24);
+            pal[i * 3 + 2] = (UBYTE)(rgb[2] >> 24);
+        }
+    }
+    palbytes = (ULONG)ncolors * 3UL;
+
+    hdr[0] = SHOT_CHUNKY;
+    hdr[1] = 0;
+    put_be16(hdr + 2, w);
+    put_be16(hdr + 4, h);
+    put_be16(hdr + 6, ncolors);
+
+    total = 8 + palbytes + pixbytes;
+    say("shot: %ldx%ld depth %ld\n", (long)w, (long)h, (long)depth);
+
+    if (send_hdr(sock, ST_OK, total) &&
+        send_all(sock, hdr, 8) &&
+        send_all(sock, pal, palbytes) &&
+        send_all(sock, pix, pixbytes))
+        ok = 1;
+
+    FreeVec(pix);
+    return ok;
+}
+
+/* ------------------------------------------------------------------ *
+ * Input injection
+ * ------------------------------------------------------------------ */
+
+/* Posting events through input.device puts them at the top of the same queue
+ * the real mouse and keyboard feed, so every application sees them as genuine
+ * input — no per-program cooperation needed.
+ *
+ * Text goes through keymap.library's MapANSI() rather than a table of our own,
+ * which is what makes typing correct on a German (or any other) keymap: the
+ * Amiga decides which raw codes and qualifiers produce the character. */
+
+static struct MsgPort *g_inport = NULL;
+static struct IOStdReq *g_inreq = NULL;
+
+static int input_open(void)
+{
+    if (g_inreq) return 1;
+    g_inport = CreateMsgPort();
+    if (!g_inport) return 0;
+    g_inreq = (struct IOStdReq *)CreateIORequest(g_inport, sizeof(struct IOStdReq));
+    if (!g_inreq) { DeleteMsgPort(g_inport); g_inport = NULL; return 0; }
+    if (OpenDevice((STRPTR)"input.device", 0, (struct IORequest *)g_inreq, 0)) {
+        DeleteIORequest((struct IORequest *)g_inreq);
+        DeleteMsgPort(g_inport);
+        g_inreq = NULL; g_inport = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+static void input_close(void)
+{
+    if (!g_inreq) return;
+    CloseDevice((struct IORequest *)g_inreq);
+    DeleteIORequest((struct IORequest *)g_inreq);
+    DeleteMsgPort(g_inport);
+    g_inreq = NULL; g_inport = NULL;
+}
+
+static void ie_init(struct InputEvent *ie)
+{
+    memset(ie, 0, sizeof *ie);
+    ie->ie_NextEvent = NULL;
+    ie->ie_SubClass = 0;
+}
+
+static void input_post(struct InputEvent *ie)
+{
+    g_inreq->io_Command = IND_WRITEEVENT;
+    g_inreq->io_Flags = 0;
+    g_inreq->io_Length = sizeof(struct InputEvent);
+    g_inreq->io_Data = (APTR)ie;
+    DoIO((struct IORequest *)g_inreq);
+}
+
+static void input_move(WORD x, WORD y)
+{
+    struct InputEvent ie;
+    ie_init(&ie);
+    ie.ie_Class = IECLASS_POINTERPOS;   /* absolute screen coordinates */
+    ie.ie_X = x;
+    ie.ie_Y = y;
+    input_post(&ie);
+}
+
+static UWORD button_code(UBYTE button)
+{
+    if (button == IN_BTN_RIGHT) return IECODE_RBUTTON;
+    if (button == IN_BTN_MIDDLE) return IECODE_MBUTTON;
+    return IECODE_LBUTTON;
+}
+
+static void input_button(UBYTE button, int down)
+{
+    struct InputEvent ie;
+    ie_init(&ie);
+    ie.ie_Class = IECLASS_RAWMOUSE;
+    ie.ie_Code = button_code(button) | (down ? 0 : IECODE_UP_PREFIX);
+    /* Relative-mouse with a zero delta: a button change and nothing else. */
+    ie.ie_Qualifier = IEQUALIFIER_RELATIVEMOUSE;
+    ie.ie_X = 0;
+    ie.ie_Y = 0;
+    input_post(&ie);
+}
+
+static void input_key(UBYTE raw, int down, UWORD qual)
+{
+    struct InputEvent ie;
+    ie_init(&ie);
+    ie.ie_Class = IECLASS_RAWKEY;
+    ie.ie_Code = raw | (down ? 0 : IECODE_UP_PREFIX);
+    ie.ie_Qualifier = qual;
+    input_post(&ie);
+}
+
+/* One character, via the active keymap. MapANSI hands back up to three
+ * code/qualifier pairs; the last is the key itself and any earlier ones are
+ * dead-key prefixes that belong in the ie_Prev*Down fields. */
+static void input_char(UBYTE ch)
+{
+    UBYTE rbuf[6];
+    LONG actual;
+    UBYTE *r = rbuf;
+    struct InputEvent ie;
+
+    actual = MapANSI((STRPTR)&ch, 1, (STRPTR)rbuf, 3, NULL);
+    if (actual < 1) return;   /* not typeable on this keymap */
+
+    ie_init(&ie);
+    ie.ie_Class = IECLASS_RAWKEY;
+    if (actual >= 3) { ie.ie_Prev2DownCode = r[0]; ie.ie_Prev2DownQual = r[1]; r += 2; }
+    if (actual >= 2) { ie.ie_Prev1DownCode = r[0]; ie.ie_Prev1DownQual = r[1]; r += 2; }
+
+    ie.ie_Code = r[0];
+    ie.ie_Qualifier = r[1];
+    input_post(&ie);
+
+    ie.ie_Code = r[0] | IECODE_UP_PREFIX;
+    input_post(&ie);
+}
+
+static int do_input(int sock, const UBYTE *p, ULONG len)
+{
+    UBYTE op;
+
+    if (!len) return send_err(sock, "empty input request");
+    if (!input_open()) return send_err(sock, "cannot open input.device");
+
+    op = p[0];
+    p++; len--;
+
+    switch (op) {
+    case IN_MOVE:
+        if (len < 4) return send_err(sock, "MOVE needs x,y");
+        input_move((WORD)((p[0] << 8) | p[1]), (WORD)((p[2] << 8) | p[3]));
+        break;
+
+    case IN_BUTTON:
+        if (len < 2) return send_err(sock, "BUTTON needs button,down");
+        input_button(p[0], p[1]);
+        break;
+
+    case IN_KEY:
+        if (len < 4) return send_err(sock, "KEY needs rawcode,down,qualifier");
+        input_key(p[0], p[1], (UWORD)((p[2] << 8) | p[3]));
+        break;
+
+    case IN_TEXT: {
+        ULONG i;
+        for (i = 0; i < len; i++) {
+            input_char(p[i]);
+            /* A tick between characters: the input queue is shallow, and
+             * applications that poll rather than buffer drop anything faster. */
+            Delay(1);
+        }
+        break;
+    }
+
+    case IN_CLICK: {
+        UBYTE button, count, n;
+        if (len < 6) return send_err(sock, "CLICK needs x,y,button,count");
+        input_move((WORD)((p[0] << 8) | p[1]), (WORD)((p[2] << 8) | p[3]));
+        button = p[4];
+        count = p[5] ? p[5] : 1;
+        Delay(2);   /* let Intuition settle on the new pointer position */
+        for (n = 0; n < count; n++) {
+            input_button(button, 1);
+            Delay(2);
+            input_button(button, 0);
+            if (n + 1 < count) Delay(2);
+        }
+        break;
+    }
+
+    default:
+        return send_err(sock, "unknown input op");
+    }
+
+    say("input: op %ld\n", (long)op);
+    return send_resp(sock, ST_OK, NULL, 0);
+}
+
+/* ------------------------------------------------------------------ *
+ * Connection loop
+ * ------------------------------------------------------------------ */
+
+/* Read one frame header plus up to `prefetch` bytes of its body. PUT needs the
+ * prefetch so it can see the path before deciding where to stream the rest. */
+static int read_frame(int sock, UBYTE *code, ULONG *len, UBYTE *body, ULONG prefetch, ULONG *got)
+{
+    UBYTE h[AMI_HDRLEN];
+
+    if (!recv_all(sock, h, AMI_HDRLEN)) return 0;
+    if (h[0] != AMI_MAGIC0 || h[1] != AMI_MAGIC1 ||
+        h[2] != AMI_MAGIC2 || h[3] != AMI_MAGIC3) return 0;
+
+    *code = h[4];
+    *len = get_be32(h + 8);
+    if (*len > AMI_MAXFRAME) return 0;
+
+    *got = *len < prefetch ? *len : prefetch;
+    if (*got && !recv_all(sock, body, *got)) return 0;
+    return 1;
+}
+
+static void serve(int sock)
+{
+    UBYTE *body = NULL;
+    UBYTE code;
+    ULONG len, got;
+    int authed = !g_have_token;
+
+    body = (UBYTE *)AllocVec(IOBUF, MEMF_ANY);
+    if (!body) { send_err(sock, "out of memory"); return; }
+
+    for (;;) {
+        if (!read_frame(sock, &code, &len, body, IOBUF, &got)) break;
+
+        if (code == CMD_AUTH) {
+            /* An agent with no token accepts the frame and moves on, rather
+             * than refusing it. A client configured with a token should not
+             * fail against an open agent — that reads as "wrong password"
+             * when the truth is "no password is set". */
+            if (!g_have_token ||
+                (got == (ULONG)strlen(g_token) && memcmp(body, g_token, got) == 0)) {
+                authed = 1;
+                send_resp(sock, ST_OK, NULL, 0);
+                continue;
+            }
+            say("auth: rejected\n");
+            send_err(sock, "bad token");
+            break;
+        }
+
+        if (!authed) {
+            send_resp(sock, ST_AUTH, NULL, 0);
+            break;
+        }
+
+        /* Every command except PUT fits its payload in the prefetch. */
+        if (code != CMD_PUT && len > got) {
+            send_err(sock, "payload larger than the 8 KiB command limit");
+            break;
+        }
+
+        switch (code) {
+        case CMD_PING: do_ping(sock); break;
+        case CMD_EXEC: do_exec(sock, body, len); break;
+        case CMD_GET:  do_get(sock, body, len); break;
+        case CMD_PUT:  do_put(sock, body, got, len); break;
+        case CMD_LIST: do_list(sock, body, len); break;
+        case CMD_INFO: do_info(sock); break;
+        case CMD_SHOT: do_shot(sock); break;
+        case CMD_INPUT: do_input(sock, body, len); break;
+        default:       send_err(sock, "unknown command"); break;
+        }
+
+        /* One command per connection, so the client always knows exactly what
+         * state the socket is in. AUTH is the one exception, handled above. */
+        break;
+    }
+
+    FreeVec(body);
+}
+
+/* ------------------------------------------------------------------ *
+ * Entry point
+ * ------------------------------------------------------------------ */
+
+static const char *TEMPLATE = "PORT/N,TOKEN/K,QUIET/S";
+
+struct args {
+    LONG *port;
+    STRPTR token;
+    LONG quiet;
+};
+
+int main(void)
+{
+    struct RDArgs *rda;
+    struct args a;
+    int listener = -1, port = 7846;
+    struct sockaddr_in sa;
+    int one = 1;
+    int rc = RETURN_OK;
+
+    memset(&a, 0, sizeof a);
+    rda = ReadArgs((STRPTR)TEMPLATE, (LONG *)&a, NULL);
+    if (!rda) {
+        PrintFault(IoErr(), (STRPTR)"amiagent");
+        return RETURN_FAIL;
+    }
+    if (a.port) port = (int)*a.port;
+    if (a.quiet) g_quiet = 1;
+    if (a.token) {
+        strncpy(g_token, (const char *)a.token, sizeof g_token - 1);
+        g_token[sizeof g_token - 1] = '\0';
+        g_have_token = 1;
+    }
+    FreeArgs(rda);
+
+    SocketBase = OpenLibrary((STRPTR)"bsdsocket.library", 4);
+    if (!SocketBase) {
+        printf("amiagent: no bsdsocket.library - start your TCP/IP stack first.\n");
+        return RETURN_FAIL;
+    }
+
+    listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) { printf("amiagent: socket() failed\n"); rc = RETURN_FAIL; goto out; }
+
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, (char *)&one, sizeof one);
+
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((unsigned short)port);
+    sa.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(listener, (struct sockaddr *)&sa, sizeof sa) < 0) {
+        printf("amiagent: cannot bind port %d (already in use?)\n", port);
+        rc = RETURN_FAIL; goto out;
+    }
+    if (listen(listener, 2) < 0) {
+        printf("amiagent: listen() failed\n");
+        rc = RETURN_FAIL; goto out;
+    }
+
+    if (!g_have_token)
+        printf("amiagent %s: listening on port %d - NO TOKEN SET, anyone on this\n"
+               "  network can run commands here. Restart with TOKEN=<secret>.\n",
+               AMIAGENT_VERSION, port);
+    else
+        say("amiagent %s: listening on port %d (token required)\n", AMIAGENT_VERSION, port);
+    say("Press Ctrl-C to stop.\n");
+
+    for (;;) {
+        struct sockaddr_in ca;
+        socklen_t calen = sizeof ca;
+        int cs;
+        int r = sock_readable(listener, -1);
+
+        if (r < 0) { say("\namiagent: stopping.\n"); break; }
+        if (r == 0) continue;
+
+        cs = accept(listener, (struct sockaddr *)&ca, &calen);
+        if (cs < 0) continue;
+
+        serve(cs);
+        CloseSocket(cs);
+    }
+
+out:
+    input_close();
+    if (CyberGfxBase) CloseLibrary(CyberGfxBase);
+    if (listener >= 0) CloseSocket(listener);
+    if (SocketBase) CloseLibrary(SocketBase);
+#ifdef AMIAGENT_OWN_LIBBASES
+    if (GfxBase) CloseLibrary((struct Library *)GfxBase);
+    if (IntuitionBase) CloseLibrary((struct Library *)IntuitionBase);
+#endif
+    return rc;
+}
