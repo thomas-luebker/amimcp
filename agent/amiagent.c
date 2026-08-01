@@ -466,7 +466,7 @@ static int do_exec(int sock, const UBYTE *payload, ULONG len)
     if (g_job.done) return job_reply(sock);
 
     sprintf(msg,
-            "still running after %us. The agent is NOT stuck — it is back to "
+            "still running after %us. The agent is NOT stuck - it is back to "
             "accepting connections, and other commands still work. Send BREAK "
             "to try to stop it, or run EXEC again later to pick up the result.",
             (unsigned)timeout);
