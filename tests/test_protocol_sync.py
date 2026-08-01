@@ -64,7 +64,7 @@ class TestProtocolSync(unittest.TestCase):
             self.assertEqual(self.c[f"IN_BTN_{name}"], amiga.BUTTONS[py])
 
     def test_command_codes_match(self):
-        for name in ("PING", "EXEC", "GET", "PUT", "LIST", "INFO", "SHOT", "INPUT", "AUTH"):
+        for name in ("PING", "EXEC", "GET", "PUT", "LIST", "INFO", "SHOT", "INPUT", "BREAK", "AUTH"):
             self.assertEqual(
                 self.c[f"CMD_{name}"],
                 getattr(amiga, f"CMD_{name}"),
@@ -91,7 +91,7 @@ class TestProtocolSync(unittest.TestCase):
 
     def test_every_command_constant_is_handled_by_the_daemon(self):
         src = read(os.path.join(HERE, "..", "agent", "amiagent.c"))
-        for name in ("PING", "EXEC", "GET", "PUT", "LIST", "INFO", "SHOT", "INPUT"):
+        for name in ("PING", "EXEC", "GET", "PUT", "LIST", "INFO", "SHOT", "INPUT", "BREAK"):
             self.assertIn(f"case CMD_{name}:", src, f"amiagent.c never handles CMD_{name}")
         self.assertIn("code == CMD_AUTH", src, "amiagent.c never handles CMD_AUTH")
 

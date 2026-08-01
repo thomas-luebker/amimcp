@@ -23,6 +23,7 @@ CMD_LIST = 0x05
 CMD_INFO = 0x06
 CMD_SHOT = 0x07
 CMD_INPUT = 0x08
+CMD_BREAK = 0x09
 CMD_AUTH = 0x10
 
 # CMD_INPUT ops (see agent/proto.h)
@@ -194,7 +195,19 @@ class Amiga:
         return self._request(CMD_PING).decode("latin-1", "replace")
 
     def exec_command(self, command: str, timeout: float = 120.0) -> tuple[int, str]:
-        body = self._request(CMD_EXEC, command.encode("latin-1"), timeout=timeout)
+        """Run a command. `timeout` is the agent's deadline, not just ours.
+
+        The agent runs the command in a child process and gives up waiting
+        after this many seconds, answering "still running" rather than hanging.
+        Our own socket timeout is deliberately longer so that answer arrives
+        instead of us timing out first and losing the explanation.
+        """
+        deadline = max(1, min(int(timeout), 65535))
+        body = self._request(
+            CMD_EXEC,
+            struct.pack(">H", deadline) + command.encode("latin-1"),
+            timeout=deadline + 15,
+        )
         if len(body) < 4:
             raise AmigaUnreachable("truncated EXEC response")
         (rc,) = struct.unpack(">I", body[:4])
@@ -203,6 +216,10 @@ class Amiga:
         if rc > 0x7FFFFFFF:
             rc -= 0x100000000
         return rc, body[4:].decode("latin-1", "replace")
+
+    def break_command(self) -> str:
+        """Ask the agent to Ctrl-C whatever command is stuck."""
+        return self._request(CMD_BREAK).decode("latin-1", "replace")
 
     def read_file(self, path: str) -> bytes:
         return self._request(CMD_GET, path.encode("latin-1"))

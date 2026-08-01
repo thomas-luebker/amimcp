@@ -52,13 +52,14 @@ TOOLS = [
     {
         "name": "amiga_shell",
         "description": (
-            "Run an AmigaDOS command on the Amiga and return its return code and "
-            "stdout. This is the workhorse: use it for Dir, List, Type, Copy, "
-            "Delete, MakeDir, Assign, Version, Avail, Status, running programs, "
-            "and anything else you would type at a Shell prompt. Only stdout is "
-            "captured — if a command writes to stderr, append a redirect. "
-            "The agent runs one command at a time and blocks until it finishes, "
-            "so avoid interactive programs and anything that waits for input."
+            "Run an AmigaDOS command on the Amiga and return its return code, "
+            "stdout and stderr. This is the workhorse: use it for Dir, List, "
+            "Type, Copy, Delete, MakeDir, Assign, Version, Avail, Status, "
+            "running programs, and anything else you would type at a Shell "
+            "prompt. The agent runs the command in a child process and gives up "
+            "waiting after `timeout` seconds, reporting that it is still "
+            "running — it does not hang. Only one command runs at a time, so a "
+            "stuck one blocks later commands until you call amiga_break."
         ),
         "inputSchema": {
             "type": "object",
@@ -69,7 +70,7 @@ TOOLS = [
                 },
                 "timeout": {
                     "type": "number",
-                    "description": "Seconds to wait for the command to finish. Default 120.",
+                    "description": "Seconds the agent waits before reporting the command is still running. Default 120.",
                 },
             },
             "required": ["command"],
@@ -167,6 +168,18 @@ TOOLS = [
                 },
             },
         },
+    },
+    {
+        "name": "amiga_break",
+        "description": (
+            "Send Ctrl-C to a command left running by amiga_shell — the fix for "
+            "a program that is waiting for input nobody will give it. Only one "
+            "command runs at a time, so use this when amiga_shell reports that "
+            "one is still running. Best effort: well-behaved AmigaDOS commands "
+            "stop, but a program ignoring Ctrl-C will need attention at the "
+            "machine itself."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "amiga_click",
@@ -439,6 +452,10 @@ def _qualifier_bits(names) -> int:
     return bits
 
 
+def tool_break(ami: Amiga, args: dict) -> list[dict]:
+    return [{"type": "text", "text": ami.break_command().strip() or "Break sent."}]
+
+
 def tool_click(ami: Amiga, args: dict) -> list[dict]:
     x, y = int(args["x"]), int(args["y"])
     button = args.get("button", "left")
@@ -473,6 +490,7 @@ def tool_key(ami: Amiga, args: dict) -> list[dict]:
 
 HANDLERS = {
     "amiga_shell": tool_shell,
+    "amiga_break": tool_break,
     "amiga_click": tool_click,
     "amiga_move_mouse": tool_move_mouse,
     "amiga_type": tool_type,

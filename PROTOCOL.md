@@ -43,13 +43,14 @@ exception: it precedes the real request on the same connection.
 | Code | Name   | Payload                              | Response payload |
 |------|--------|--------------------------------------|------------------|
 | 0x01 | `PING` | *(empty)*                            | Agent banner, text |
-| 0x02 | `EXEC` | AmigaDOS command line, text          | `rc` (u32) + captured output |
+| 0x02 | `EXEC` | `deadline` (u16, seconds) + command line | `rc` (u32) + captured output |
 | 0x03 | `GET`  | Path, text                           | Raw file bytes |
 | 0x04 | `PUT`  | `pathlen` (u16) + path + file bytes  | *(empty)* |
 | 0x05 | `LIST` | Path, text                           | TSV directory listing |
 | 0x06 | `INFO` | *(empty)*                            | `key=value` lines |
 | 0x07 | `SHOT` | *(empty)*                            | Screen capture (see below) |
 | 0x08 | `INPUT`| Op byte + op fields (see below)      | *(empty)* |
+| 0x09 | `BREAK`| *(empty)*                            | What was signalled, text |
 | 0x10 | `AUTH` | Shared token, text                   | *(empty)* |
 
 Text payloads are **not** NUL-terminated; the frame length delimits them.
@@ -75,13 +76,30 @@ machine you are trying to repair is the wrong trade. Treat this as a trusted-LAN
 protocol: bind to the LAN interface, keep it off the open internet, and set a
 token so a stray port scan cannot run `Format`.
 
-## `EXEC` response
+## `EXEC`
+
+The payload is a `u16` deadline in seconds followed by the command line. `0`
+means the agent's default of 120.
 
 ```
-offset  size  field
+offset  size  field                       (response)
 0       4     rc      the command's AmigaDOS return code (u32)
 4       ...   output  bytes the command wrote to stdout
 ```
+
+**The command does not run on the accept loop's process.** A child process runs
+it while the agent waits with the deadline. If the deadline passes, the agent
+answers `ERR` saying the command is still running, goes back to accepting
+connections, and leaves it running.
+
+That structure is the whole point: up to 0.2.0 the command ran inline, so a
+single program waiting for input nobody would give it parked the agent forever,
+recoverable only by Ctrl-C at the physical machine. Now `PING`, `INFO`, `GET`,
+`LIST`, `SHOT` and `INPUT` all keep working while a command is stuck. Only a
+second `EXEC` is refused, with a message naming the command that is blocking it.
+
+A finished-but-unreported job is reaped on the next `EXEC`, so a client that
+gave up and reconnected does not leak the temp files.
 
 Captured with `SystemTags(SYS_Input, …, SYS_Output, …)`, plus `SYS_Error` where
 the OS has it — that tag arrived in `dos.library` v47 (AmigaOS 3.2), so on 3.2
@@ -96,6 +114,19 @@ opposite is a quiet, confusing failure rather than a loud one — the output fil
 is never flushed, so every command reports success with empty output, and the
 file stays locked, so the *next* command fails to create it. That was a real bug
 in 0.1.0, found within a minute of first touching real hardware.
+
+## `BREAK`
+
+Sends `SIGBREAKF_CTRL_C` to the stuck command. Best effort, and honest about it:
+the response says how many processes were signalled, and a program that ignores
+Ctrl-C still needs attention at the machine.
+
+Finding the right process takes a small trick. `System()` runs the command in
+its own CLI process that the agent never gets a pointer to, so before starting a
+job the agent snapshots which CLI numbers exist (`MaxCli()` / `FindCliProc()`).
+On `BREAK` it takes the snapshot again and signals anything that appeared since,
+plus the child process it did create.
+
 
 ## `LIST` response
 

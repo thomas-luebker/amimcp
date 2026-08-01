@@ -40,6 +40,7 @@ Two halves:
 | `amiga_move_mouse` | Move the pointer without clicking |
 | `amiga_type` | Type text, mapped through the Amiga's own keymap |
 | `amiga_key` | Press Return, Esc, F-keys and so on, with qualifiers |
+| `amiga_break` | Ctrl-C a command left running by `amiga_shell` |
 
 Together those are enough to actually work: read a Startup-Sequence and fix it,
 cross-compile a binary and push it over and run it, launch a GUI program and
@@ -181,11 +182,13 @@ and about 7 seconds on the wire; the PNG that reaches Claude is around 850 KiB.
 
 ## Known limits
 
-- **Interactive programs block `amiga_shell`.** The agent runs one command at a
-  time and waits for it to exit, so anything that sits waiting for keyboard
-  input wedges it until you Ctrl-C the agent on the Amiga itself. This applies
-  to *shell* commands — a GUI program launched with `Run` can then be driven
-  perfectly well with `amiga_click` and `amiga_type`.
+- **One command at a time.** Commands run in a child process with a deadline,
+  so a program waiting for input no longer wedges the agent — everything else
+  keeps working and `amiga_break` sends it Ctrl-C. But a stuck command does
+  block later `amiga_shell` calls until it is broken or finishes.
+- **The client and agent must be the same version.** The wire format changed in
+  0.3.0; mixing 0.2.0 with 0.3.0 produces confusing errors rather than a clean
+  refusal. `--probe` prints the agent's version.
 - **stderr needs OS 3.2+.** `SYS_Error` arrived in `dos.library` v47, so on 3.2
   and later stderr is captured and appended after a `--- stderr ---` marker.
   Older systems get stdout only.
@@ -220,7 +223,7 @@ It is a test double, not an emulator: `EXEC` understands a handful of
 AmigaDOS-shaped commands rather than actually running AmigaDOS.
 
 ```sh
-./run_tests.sh     # 61 tests, no hardware and no cross-compiler needed
+./run_tests.sh     # 69 tests, no hardware and no cross-compiler needed
 ```
 
 ## Layout

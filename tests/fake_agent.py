@@ -22,13 +22,14 @@ import socketserver
 import struct
 import sys
 import threading
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "server"))
 
 from amiga import (  # noqa: E402
-    CMD_AUTH, CMD_EXEC, CMD_GET, CMD_INFO, CMD_INPUT, CMD_LIST, CMD_PING, CMD_PUT,
-    CMD_SHOT, HDRLEN, IN_BUTTON, IN_CLICK, IN_KEY, IN_MOVE, IN_TEXT, MAGIC,
-    SHOT_CHUNKY, SHOT_RGB24, ST_AUTH, ST_ERR, ST_OK,
+    CMD_AUTH, CMD_BREAK, CMD_EXEC, CMD_GET, CMD_INFO, CMD_INPUT, CMD_LIST,
+    CMD_PING, CMD_PUT, CMD_SHOT, HDRLEN, IN_BUTTON, IN_CLICK, IN_KEY, IN_MOVE,
+    IN_TEXT, MAGIC, SHOT_CHUNKY, SHOT_RGB24, ST_AUTH, ST_ERR, ST_OK,
 )
 
 # Every input event the fake agent is asked to inject, so tests can assert on
@@ -156,6 +157,84 @@ def fake_info() -> bytes:
     ).encode("latin-1")
 
 
+class Job:
+    """Mirrors the real agent's one-command-at-a-time model.
+
+    The agent runs commands in a child process and stops waiting at the
+    deadline; a stuck command blocks later EXECs until BREAK. Modelling that
+    here is what lets the timeout, busy and break paths be tested without an
+    Amiga attached.
+    """
+
+    lock = threading.Lock()
+    active = None          # the command line, while one is outstanding
+    finished = False
+    rc = 0
+    out = ""
+    stop = None            # set by BREAK to release a sleeping command
+
+
+JOB = Job()
+
+
+def _run_job(cmd: str, seconds: float) -> None:
+    broke = JOB.stop.wait(seconds)
+    with JOB.lock:
+        JOB.finished = True
+        JOB.rc = 20 if broke else 0
+        JOB.out = "*** Break\n" if broke else f"slept {seconds:g}s\n"
+
+
+def fake_exec(body: bytes) -> bytes:
+    """EXEC payload is a u16 deadline followed by the command line."""
+    (deadline,) = struct.unpack(">H", body[:2])
+    cmd = body[2:].decode("latin-1")
+    deadline = deadline or 120
+
+    with JOB.lock:
+        if JOB.active and JOB.finished:
+            JOB.active = None          # reap
+        busy = JOB.active
+
+    if busy:
+        raise Busy(f'a command is still running: "{busy}". Send BREAK to try to stop it.')
+
+    if cmd.lower().startswith("sleep "):
+        secs = float(cmd.split()[1])
+        with JOB.lock:
+            JOB.active, JOB.finished, JOB.stop = cmd, False, threading.Event()
+        threading.Thread(target=_run_job, args=(cmd, secs), daemon=True).start()
+        JOB.stop.wait(0)  # let the thread start
+        for _ in range(int(deadline * 100)):
+            with JOB.lock:
+                if JOB.finished:
+                    JOB.active = None
+                    return struct.pack(">I", JOB.rc & 0xFFFFFFFF) + JOB.out.encode("latin-1")
+            time.sleep(0.01)
+        raise StillRunning(f"still running after {deadline}s. The agent is NOT stuck.")
+
+    rc, out = fake_shell(cmd)
+    return struct.pack(">I", rc & 0xFFFFFFFF) + out.encode("latin-1")
+
+
+def fake_break() -> bytes:
+    with JOB.lock:
+        if not JOB.active:
+            raise Busy("no command is running")
+        ev = JOB.stop
+    if ev:
+        ev.set()
+    return b"sent Ctrl-C to 1 process(es)"
+
+
+class Busy(Exception):
+    pass
+
+
+class StillRunning(Exception):
+    pass
+
+
 class Handler(socketserver.BaseRequestHandler):
     def recv_exact(self, n: int) -> bytes:
         chunks, got = [], 0
@@ -209,8 +288,9 @@ class Handler(socketserver.BaseRequestHandler):
                 fake_input(body)
                 self.reply(ST_OK)
             elif code == CMD_EXEC:
-                rc, out = fake_shell(body.decode("latin-1"))
-                self.reply(ST_OK, struct.pack(">I", rc & 0xFFFFFFFF) + out.encode("latin-1"))
+                self.reply(ST_OK, fake_exec(body))
+            elif code == CMD_BREAK:
+                self.reply(ST_OK, fake_break())
             elif code == CMD_GET:
                 with open(to_host(body.decode("latin-1")), "rb") as fh:
                     self.reply(ST_OK, fh.read())
@@ -226,6 +306,8 @@ class Handler(socketserver.BaseRequestHandler):
                 self.reply(ST_OK, self.listing(body.decode("latin-1")))
             else:
                 self.reply(ST_ERR, b"unknown command")
+        except (Busy, StillRunning) as e:
+            self.reply(ST_ERR, str(e).encode("latin-1"))
         except FileNotFoundError as e:
             self.reply(ST_ERR, f"cannot open \"{e.filename}\" (DOS error 205)".encode("latin-1"))
         except Exception as e:  # noqa: BLE001

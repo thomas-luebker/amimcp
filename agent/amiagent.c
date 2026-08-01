@@ -33,6 +33,7 @@ typedef long ssize_t;
 #include <dos/dos.h>
 #include <dos/dostags.h>
 #include <dos/datetime.h>
+#include <dos/dosextens.h>
 #include <exec/io.h>
 #include <devices/input.h>
 #include <devices/inputevent.h>
@@ -279,59 +280,111 @@ static int pump(int sock, BPTR fh, ULONG len)
 
 static const char ERRMARK[] = "\n--- stderr ---\n";
 
-static int do_exec(int sock, const UBYTE *payload, ULONG len)
-{
-    char outname[64], errname[64];
-    char *cmd;
-    BPTR out, in, err = 0, fo = 0, fe = 0;
+/* ------------------------------------------------------------------ *
+ * Command execution
+ *
+ * The command does NOT run on the accept loop's process. Up to 0.2.0 it did,
+ * and a single command that waited for input — any interactive program, a
+ * requester nobody answers — parked the whole agent forever. The only recovery
+ * was Ctrl-C at the physical machine, which rather defeats a remote agent.
+ *
+ * So a child process runs the command while this one waits with a deadline.
+ * On timeout we answer the client, go back to accepting connections, and leave
+ * the command running. PING, INFO, GET, SHOT and INPUT keep working; only a
+ * second EXEC is refused, and BREAK can try to stop the stuck one.
+ * ------------------------------------------------------------------ */
+
+struct job {
+    volatile LONG busy;      /* a command has been started and not yet reaped */
+    volatile LONG done;      /* the child has finished; rc is valid */
     LONG rc;
-    ULONG outlen = 0, errlen = 0, marklen = 0;
-    UBYTE rcbuf[4];
-    int have_err = (((struct Library *)DOSBase)->lib_Version >= 47);
-    int ok = 0;
+    char cmd[512];
+    char outname[64], errname[64];
+    int have_err;
+    struct Task *parent;
+    BYTE sigbit;
+    struct Process *proc;
+    ULONG clis[8];           /* CLI numbers that existed before we started */
+    ULONG started;           /* Delay ticks elapsed, for the "still running" message */
+};
 
-    cmd = dup_cstr(payload, len);
-    if (!cmd) return send_err(sock, "out of memory");
+static struct job g_job;
 
-    sprintf(outname, "T:amiagent-%08lx.out", (unsigned long)FindTask(NULL));
-    sprintf(errname, "T:amiagent-%08lx.err", (unsigned long)FindTask(NULL));
+/* Record which CLI processes exist right now. System() runs the command in a
+ * new CLI, so anything that appears after this snapshot is very likely ours —
+ * which is how BREAK finds something to signal. */
+static void cli_snapshot(ULONG *bits)
+{
+    ULONG n, max;
+    memset(bits, 0, sizeof g_job.clis);
+    Forbid();
+    max = MaxCli();
+    if (max > 255) max = 255;
+    for (n = 1; n <= max; n++)
+        if (FindCliProc(n)) bits[n >> 5] |= 1UL << (n & 31);
+    Permit();
+}
 
-    out = Open((STRPTR)outname, MODE_NEWFILE);
-    if (!out) { FreeVec(cmd); return send_err(sock, "cannot open T: for command output"); }
+/* The child. Deliberately free of stdio — printf from a second process while
+ * the parent may also be writing is not worth the risk. */
+static void job_entry(void)
+{
+    struct job *j = &g_job;
+    BPTR in, out, err = 0;
+
+    j->rc = -1;
+    out = Open((STRPTR)j->outname, MODE_NEWFILE);
     in = Open((STRPTR)"NIL:", MODE_OLDFILE);
-    if (!in) { Close(out); DeleteFile((STRPTR)outname); FreeVec(cmd);
-               return send_err(sock, "cannot open NIL:"); }
-    if (have_err) err = Open((STRPTR)errname, MODE_NEWFILE);
+    if (j->have_err) err = Open((STRPTR)j->errname, MODE_NEWFILE);
 
-    say("exec: %s\n", cmd);
+    if (in && out)
+        j->rc = SystemTags((STRPTR)j->cmd,
+                           SYS_Input, (ULONG)in,
+                           SYS_Output, (ULONG)out,
+                           err ? SYS_Error : TAG_IGNORE, (ULONG)err,
+                           TAG_DONE);
 
-    rc = SystemTags((STRPTR)cmd,
-                    SYS_Input, (ULONG)in,
-                    SYS_Output, (ULONG)out,
-                    err ? SYS_Error : TAG_IGNORE, (ULONG)err,
-                    TAG_DONE);
-    FreeVec(cmd);
-
-    /* Ours to close — and closing is also what flushes them to disk. */
-    Close(in);
-    Close(out);
+    /* Ours to close — see the dos.library autodoc note in PROTOCOL.md. */
+    if (in) Close(in);
+    if (out) Close(out);
     if (err) Close(err);
 
-    if (rc == -1) {
-        DeleteFile((STRPTR)outname);
-        if (have_err) DeleteFile((STRPTR)errname);
+    j->done = 1;
+    Signal(j->parent, 1UL << j->sigbit);
+}
+
+/* Finish with a completed job: temp files gone, slot free for the next one. */
+static void job_reap(void)
+{
+    DeleteFile((STRPTR)g_job.outname);
+    if (g_job.have_err) DeleteFile((STRPTR)g_job.errname);
+    g_job.busy = 0;
+    g_job.done = 0;
+    g_job.proc = NULL;
+}
+
+/* Send rc + captured output for a finished job. */
+static int job_reply(int sock)
+{
+    BPTR fo, fe = 0;
+    ULONG outlen, errlen = 0, marklen = 0;
+    UBYTE rcbuf[4];
+    int ok = 0;
+
+    if (g_job.rc == -1) {
+        job_reap();
         return send_err(sock, "could not launch command (not found, or no memory)");
     }
 
-    fo = Open((STRPTR)outname, MODE_OLDFILE);
+    fo = Open((STRPTR)g_job.outname, MODE_OLDFILE);
     outlen = file_size(fo);
-    if (have_err) {
-        fe = Open((STRPTR)errname, MODE_OLDFILE);
+    if (g_job.have_err) {
+        fe = Open((STRPTR)g_job.errname, MODE_OLDFILE);
         errlen = file_size(fe);
         if (errlen) marklen = sizeof ERRMARK - 1;
     }
 
-    put_be32(rcbuf, (ULONG)rc);
+    put_be32(rcbuf, (ULONG)g_job.rc);
     if (send_hdr(sock, ST_OK, 4 + outlen + marklen + errlen) &&
         send_all(sock, rcbuf, 4)) {
         ok = 1;
@@ -344,9 +397,114 @@ static int do_exec(int sock, const UBYTE *payload, ULONG len)
 
     if (fo) Close(fo);
     if (fe) Close(fe);
-    DeleteFile((STRPTR)outname);
-    if (have_err) DeleteFile((STRPTR)errname);
+    job_reap();
     return ok;
+}
+
+static int do_exec(int sock, const UBYTE *payload, ULONG len)
+{
+    UWORD timeout;
+    ULONG waited = 0, limit;
+    char msg[640];
+
+    if (len < 2) return send_err(sock, "EXEC needs a timeout prefix");
+    timeout = (UWORD)((payload[0] << 8) | payload[1]);
+    payload += 2;
+    len -= 2;
+    if (!timeout) timeout = 120;
+
+    /* An earlier command that outlived its deadline may have finished since. */
+    if (g_job.busy && g_job.done) job_reap();
+
+    if (g_job.busy) {
+        sprintf(msg,
+                "a command is still running after %lus and this agent runs one "
+                "at a time: \"%s\". Send BREAK to try to stop it, or wait.",
+                (unsigned long)(g_job.started / 50), g_job.cmd);
+        return send_err(sock, msg);
+    }
+
+    if (len >= sizeof g_job.cmd) return send_err(sock, "command line too long");
+    if (g_job.sigbit == 0 && (g_job.sigbit = AllocSignal(-1)) == -1)
+        return send_err(sock, "no signal available");
+
+    CopyMem((APTR)payload, g_job.cmd, len);
+    g_job.cmd[len] = '\0';
+    g_job.have_err = (((struct Library *)DOSBase)->lib_Version >= 47);
+    sprintf(g_job.outname, "T:amiagent-%08lx.out", (unsigned long)FindTask(NULL));
+    sprintf(g_job.errname, "T:amiagent-%08lx.err", (unsigned long)FindTask(NULL));
+    g_job.parent = FindTask(NULL);
+    g_job.rc = -1;
+    g_job.done = 0;
+    g_job.started = 0;
+
+    say("exec: %s\n", g_job.cmd);
+    cli_snapshot(g_job.clis);
+
+    SetSignal(0, 1UL << g_job.sigbit);   /* clear any stale completion signal */
+    g_job.busy = 1;
+    g_job.proc = CreateNewProcTags(NP_Entry, (ULONG)job_entry,
+                                   NP_Name, (ULONG)"amiagent-command",
+                                   NP_StackSize, 16384,
+                                   TAG_DONE);
+    if (!g_job.proc) {
+        g_job.busy = 0;
+        return send_err(sock, "could not create a process for the command");
+    }
+
+    /* Poll rather than Wait() so Ctrl-C on the agent still works and the
+     * deadline is honoured. 1/10s costs nothing next to running a command. */
+    limit = (ULONG)timeout * 50UL;
+    while (!g_job.done) {
+        if (SetSignal(0, 0) & SIGBREAKF_CTRL_C) break;
+        if (waited >= limit) break;
+        Delay(5);
+        waited += 5;
+        g_job.started = waited;
+    }
+
+    if (g_job.done) return job_reply(sock);
+
+    sprintf(msg,
+            "still running after %us. The agent is NOT stuck — it is back to "
+            "accepting connections, and other commands still work. Send BREAK "
+            "to try to stop it, or run EXEC again later to pick up the result.",
+            (unsigned)timeout);
+    return send_err(sock, msg);
+}
+
+/* Best effort: signal the child, and any CLI that appeared after it started —
+ * that second part is what actually reaches the command, because System() runs
+ * it in its own CLI process that we never get a pointer to. */
+static int do_break(int sock)
+{
+    ULONG now[8];
+    ULONG n, max, hit = 0;
+    char msg[160];
+
+    if (!g_job.busy) return send_err(sock, "no command is running");
+    if (g_job.done) { job_reap(); return send_resp(sock, ST_OK, NULL, 0); }
+
+    Forbid();
+    if (g_job.proc) { Signal(&g_job.proc->pr_Task, SIGBREAKF_CTRL_C); hit++; }
+    Permit();
+
+    cli_snapshot(now);
+    Forbid();
+    max = MaxCli();
+    if (max > 255) max = 255;
+    for (n = 1; n <= max; n++) {
+        int was = (g_job.clis[n >> 5] >> (n & 31)) & 1;
+        struct Process *p = FindCliProc(n);
+        if (!was && p) { Signal(&p->pr_Task, SIGBREAKF_CTRL_C); hit++; }
+    }
+    Permit();
+
+    say("break: signalled %ld process(es)\n", (long)hit);
+    sprintf(msg, "sent Ctrl-C to %lu process(es); the command may take a "
+                 "moment to notice, and not every program obeys it.",
+            (unsigned long)hit);
+    return send_resp(sock, ST_OK, msg, (ULONG)strlen(msg));
 }
 
 static int do_get(int sock, const UBYTE *payload, ULONG len)
@@ -1000,6 +1158,7 @@ static void serve(int sock)
         case CMD_INFO: do_info(sock); break;
         case CMD_SHOT: do_shot(sock); break;
         case CMD_INPUT: do_input(sock, body, len); break;
+        case CMD_BREAK: do_break(sock); break;
         default:       send_err(sock, "unknown command"); break;
         }
 

@@ -24,6 +24,7 @@
 #define CMD_INFO 0x06
 #define CMD_SHOT 0x07
 #define CMD_INPUT 0x08
+#define CMD_BREAK 0x09
 #define CMD_AUTH 0x10
 
 /* CMD_INPUT payload: one op byte, then the op's own fields. Keeping several
@@ -53,6 +54,6 @@
 #define SHOT_CHUNKY 1   /* palette + 1 byte/pixel */
 #define SHOT_RGB24  2   /* 3 bytes/pixel, no palette */
 
-#define AMIAGENT_VERSION "0.2.0"
+#define AMIAGENT_VERSION "0.3.0"
 
 #endif /* AMIMCP_PROTO_H */

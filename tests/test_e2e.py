@@ -135,6 +135,66 @@ class TestAuth(Base):
             wrong.ping()
 
 
+class TestHungCommand(Base):
+    """The 0.2.0 wedge: one stuck command parked the agent forever."""
+
+    def tearDown(self):
+        try:
+            self.ami.break_command()
+        except AmigaError:
+            pass
+        fake_agent.JOB.active = None
+
+    def test_short_command_still_returns_normally(self):
+        rc, out = self.ami.exec_command("sleep 0.1", timeout=10)
+        self.assertEqual(rc, 0)
+        self.assertIn("slept", out)
+
+    def test_command_past_the_deadline_reports_instead_of_hanging(self):
+        with self.assertRaises(AmigaError) as ctx:
+            self.ami.exec_command("sleep 30", timeout=1)
+        self.assertIn("still running", str(ctx.exception))
+        self.assertIn("NOT stuck", str(ctx.exception))
+
+    def test_agent_stays_responsive_while_a_command_is_stuck(self):
+        with self.assertRaises(AmigaError):
+            self.ami.exec_command("sleep 30", timeout=1)
+        # The whole point: everything else keeps working.
+        self.assertIn("fake_agent", self.ami.ping())
+        self.assertEqual(self.ami.system_info()["cpu"], "68030")
+        self.assertTrue(self.ami.list_dir("SYS:"))
+
+    def test_second_command_is_refused_with_an_explanation(self):
+        with self.assertRaises(AmigaError):
+            self.ami.exec_command("sleep 30", timeout=1)
+        with self.assertRaises(AmigaError) as ctx:
+            self.ami.exec_command("Version", timeout=5)
+        self.assertIn("still running", str(ctx.exception))
+        self.assertIn("BREAK", str(ctx.exception))
+
+    def test_break_frees_the_agent(self):
+        with self.assertRaises(AmigaError):
+            self.ami.exec_command("sleep 30", timeout=1)
+        self.assertIn("Ctrl-C", self.ami.break_command())
+        # Give the fake job a moment to notice, then commands work again.
+        import time as _t
+        for _ in range(200):
+            try:
+                rc, out = self.ami.exec_command("Version", timeout=5)
+                break
+            except AmigaError:
+                _t.sleep(0.01)
+        else:
+            self.fail("agent never recovered after BREAK")
+        self.assertEqual(rc, 0)
+        self.assertIn("Kickstart", out)
+
+    def test_break_with_nothing_running_is_a_clear_error(self):
+        with self.assertRaises(AmigaError) as ctx:
+            self.ami.break_command()
+        self.assertIn("no command is running", str(ctx.exception))
+
+
 class TestInput(Base):
     def setUp(self):
         fake_agent.INPUT_LOG.clear()
@@ -317,6 +377,22 @@ class TestMCP(Base):
     def test_system_info_tool(self):
         res = self.tool("amiga_system_info")
         self.assertIn("68030", res["content"][0]["text"])
+
+    def test_break_tool(self):
+        with self.assertRaises(AmigaError):
+            self.ami.exec_command("sleep 30", timeout=1)
+        res = self.tool("amiga_break")
+        self.assertFalse(res["isError"])
+        self.assertIn("Ctrl-C", res["content"][0]["text"])
+        fake_agent.JOB.active = None
+
+    def test_shell_tool_surfaces_a_stuck_command_as_is_error(self):
+        with self.assertRaises(AmigaError):
+            self.ami.exec_command("sleep 30", timeout=1)
+        res = self.tool("amiga_shell", {"command": "Version", "timeout": 2})
+        self.assertTrue(res["isError"])
+        self.assertIn("still running", res["content"][0]["text"])
+        self.ami.break_command(); fake_agent.JOB.active = None
 
     def test_click_tool(self):
         fake_agent.INPUT_LOG.clear()
