@@ -216,6 +216,26 @@ class TestInput(Base):
             self.ami.input_click(0, 0, "elbow")
         self.assertEqual(fake_agent.INPUT_LOG, [])
 
+    def test_relative_move(self):
+        self.ami.input_move_rel(40, -25)
+        self.assertEqual(fake_agent.INPUT_LOG, [("rmove", 40, -25)])
+
+    def test_relative_move_carries_negatives(self):
+        # The wire field is signed; an unsigned pack would send 65216 here and
+        # the pointer would shoot off to the right instead of to the left.
+        self.ami.input_move_rel(-320, -240)
+        self.assertEqual(fake_agent.INPUT_LOG, [("rmove", -320, -240)])
+
+    def test_home(self):
+        self.ami.input_home()
+        self.assertEqual(fake_agent.INPUT_LOG, [("home",)])
+
+    def test_point_is_home_then_relative(self):
+        # Absolute positioning for programs that ignore pointer warps: the
+        # order matters, since the delta is measured from the corner.
+        self.ami.input_point(160, 120)
+        self.assertEqual(fake_agent.INPUT_LOG, [("home",), ("rmove", 160, 120)])
+
     def test_text(self):
         self.ami.input_text("Hallo Amiga")
         self.assertEqual(fake_agent.INPUT_LOG, [("text", "Hallo Amiga")])

@@ -28,7 +28,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from amiga import (  # noqa: E402
     CMD_AUTH, CMD_BREAK, CMD_EXEC, CMD_GET, CMD_INFO, CMD_INPUT, CMD_LIST,
-    CMD_PING, CMD_PUT, CMD_SHOT, HDRLEN, IN_BUTTON, IN_CLICK, IN_KEY, IN_MOVE,
+    CMD_PING, CMD_PUT, CMD_SHOT, HDRLEN, IN_BUTTON, IN_CLICK, IN_HOME, IN_KEY,
+    IN_MOVE, IN_RMOVE,
     IN_TEXT, MAGIC, SHOT_CHUNKY, SHOT_RGB24, ST_AUTH, ST_ERR, ST_OK,
 )
 
@@ -138,6 +139,10 @@ def fake_input(body: bytes) -> None:
     elif op == IN_CLICK:
         x, y, button, count = struct.unpack(">HHBB", p[:6])
         INPUT_LOG.append(("click", x, y, button, count))
+    elif op == IN_RMOVE:
+        INPUT_LOG.append(("rmove", *struct.unpack(">hh", p[:4])))
+    elif op == IN_HOME:
+        INPUT_LOG.append(("home",))
     else:
         raise ValueError(f"unknown input op {op}")
 

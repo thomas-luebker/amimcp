@@ -976,6 +976,57 @@ static void input_move(WORD x, WORD y)
     input_post(&ie);
 }
 
+/* Relative motion, for programs that never ask Intuition where the pointer is.
+ * SDL is the common case: it tracks its own cursor from RAWMOUSE deltas and
+ * ignores IECLASS_POINTERPOS warps entirely, so input_move() above moves the
+ * Intuition pointer while the program's cursor stays exactly where it was.
+ *
+ * The delta is emitted in small steps rather than one jump. ie_X is a WORD and
+ * would carry the whole distance, but a program that accumulates motion per
+ * event — or any pointer acceleration in the path — follows a run of modest
+ * steps far more predictably than a single large one. */
+#define RMOVE_STEP 32
+
+static void input_rmove_once(WORD dx, WORD dy)
+{
+    struct InputEvent ie;
+    ie_init(&ie);
+    ie.ie_Class = IECLASS_RAWMOUSE;
+    ie.ie_Code = IECODE_NOBUTTON;
+    ie.ie_Qualifier = IEQUALIFIER_RELATIVEMOUSE;
+    ie.ie_X = dx;
+    ie.ie_Y = dy;
+    input_post(&ie);
+}
+
+static void input_rmove(WORD dx, WORD dy)
+{
+    while (dx || dy) {
+        WORD sx = dx, sy = dy;
+        if (sx >  RMOVE_STEP) sx =  RMOVE_STEP;
+        if (sx < -RMOVE_STEP) sx = -RMOVE_STEP;
+        if (sy >  RMOVE_STEP) sy =  RMOVE_STEP;
+        if (sy < -RMOVE_STEP) sy = -RMOVE_STEP;
+        input_rmove_once(sx, sy);
+        dx = (WORD)(dx - sx);
+        dy = (WORD)(dy - sy);
+        Delay(1);
+    }
+}
+
+/* Drive the pointer hard into the top-left corner, giving the caller a known
+ * origin to measure a relative move from. Overshooting is the point: both
+ * Intuition and SDL clamp at the edge, so a deliberate excess of travel is
+ * what makes the resulting position certain rather than approximate. */
+static void input_home(void)
+{
+    int i;
+    for (i = 0; i < 24; i++) {
+        input_rmove_once(-(RMOVE_STEP * 4), -(RMOVE_STEP * 4));
+        Delay(1);
+    }
+}
+
 static UWORD button_code(UBYTE button)
 {
     if (button == IN_BTN_RIGHT) return IECODE_RBUTTON;
@@ -1068,6 +1119,15 @@ static int do_input(int sock, const UBYTE *p, ULONG len)
         }
         break;
     }
+
+    case IN_RMOVE:
+        if (len < 4) return send_err(sock, "RMOVE needs dx,dy");
+        input_rmove((WORD)((p[0] << 8) | p[1]), (WORD)((p[2] << 8) | p[3]));
+        break;
+
+    case IN_HOME:
+        input_home();
+        break;
 
     case IN_CLICK: {
         UBYTE button, count, n;

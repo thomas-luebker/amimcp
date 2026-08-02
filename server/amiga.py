@@ -32,6 +32,8 @@ IN_BUTTON = 2
 IN_KEY = 3
 IN_TEXT = 4
 IN_CLICK = 5
+IN_RMOVE = 6
+IN_HOME = 7
 
 BUTTONS = {"left": 0, "right": 1, "middle": 2}
 
@@ -283,6 +285,31 @@ class Amiga:
     def input_click(self, x: int, y: int, button: str = "left", count: int = 1) -> None:
         self._request(CMD_INPUT,
                       struct.pack(">BHHBB", IN_CLICK, x, y, _button(button), count))
+
+    # Intuition programs follow the pointer warp that input_move() sends. SDL
+    # and other programs that read raw mouse deltas do not: they keep their own
+    # cursor and never see the warp, so a warp-then-click lands wherever that
+    # program last believed the pointer was. For those, move relatively.
+
+    def input_move_rel(self, dx: int, dy: int) -> None:
+        """Move the pointer by a delta. Works for SDL/game programs."""
+        self._request(CMD_INPUT, struct.pack(">Bhh", IN_RMOVE, dx, dy),
+                      timeout=max(self.timeout, 5 + (abs(dx) + abs(dy)) * 0.05))
+
+    def input_home(self) -> None:
+        """Pin the pointer in the top-left corner, establishing a known origin."""
+        self._request(CMD_INPUT, bytes([IN_HOME]),
+                      timeout=max(self.timeout, 15))
+
+    def input_point(self, x: int, y: int) -> None:
+        """Put an SDL program's cursor at (x, y) — home, then move by that much.
+
+        Absolute positioning built out of relative moves. Slower than
+        input_move() and only needed for programs that ignore pointer warps;
+        prefer input_move() for Intuition applications.
+        """
+        self.input_home()
+        self.input_move_rel(x, y)
 
     def screenshot(self, timeout: float = 60.0) -> Screenshot:
         body = self._request(CMD_SHOT, timeout=timeout)

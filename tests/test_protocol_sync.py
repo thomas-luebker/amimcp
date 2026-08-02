@@ -52,7 +52,7 @@ class TestProtocolSync(unittest.TestCase):
         self.assertEqual("".join(chars).encode(), amiga.MAGIC)
 
     def test_input_ops_match(self):
-        for name in ("MOVE", "BUTTON", "KEY", "TEXT", "CLICK"):
+        for name in ("MOVE", "BUTTON", "KEY", "TEXT", "CLICK", "RMOVE", "HOME"):
             self.assertEqual(
                 self.c[f"IN_{name}"],
                 getattr(amiga, f"IN_{name}"),

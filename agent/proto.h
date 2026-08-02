@@ -35,6 +35,15 @@
 #define IN_KEY    3   /* u8 rawcode, u8 down, u16 qualifier    */
 #define IN_TEXT   4   /* latin-1 text, mapped via the Amiga's own keymap */
 #define IN_CLICK  5   /* u16 x, u16 y, u8 button, u8 count     */
+#define IN_RMOVE  6   /* s16 dx, s16 dy - relative motion      */
+#define IN_HOME   7   /* no fields - pin the pointer at the top-left corner */
+
+/* IN_MOVE warps the pointer with IECLASS_POINTERPOS, which is what Intuition
+ * programs follow. SDL — and anything else that reads raw mouse deltas rather
+ * than asking Intuition where the pointer is — ignores those warps completely
+ * and keeps its own cursor, so a warp followed by a click lands wherever that
+ * program last thought the pointer was. Driving ScummVM is the case that
+ * forced IN_RMOVE and IN_HOME: home to a known corner, then move by a delta. */
 
 #define IN_BTN_LEFT   0
 #define IN_BTN_RIGHT  1
@@ -54,6 +63,6 @@
 #define SHOT_CHUNKY 1   /* palette + 1 byte/pixel */
 #define SHOT_RGB24  2   /* 3 bytes/pixel, no palette */
 
-#define AMIAGENT_VERSION "0.3.3"
+#define AMIAGENT_VERSION "0.4.0"
 
 #endif /* AMIMCP_PROTO_H */

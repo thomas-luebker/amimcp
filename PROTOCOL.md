@@ -185,6 +185,8 @@ One op byte, then that op's fields:
 | 3  | `KEY`    | `rawcode` (u8), `down` (u8), `qualifier` (u16) |
 | 4  | `TEXT`   | latin-1 text                        |
 | 5  | `CLICK`  | `x` (u16), `y` (u16), `button` (u8), `count` (u8) |
+| 6  | `RMOVE`  | `dx` (**s16**), `dy` (**s16**)      |
+| 7  | `HOME`   | *(no fields)*                       |
 
 `button` is 0 left, 1 right, 2 middle.
 
@@ -195,6 +197,35 @@ as genuine input, with no cooperation required from the program being driven.
 `MOVE` and the move inside `CLICK` use `IECLASS_POINTERPOS`, which takes
 absolute screen coordinates. Button events use `IECLASS_RAWMOUSE` with a zero
 relative delta, so they change button state and nothing else.
+
+### Absolute versus relative pointer motion
+
+**`MOVE` does not work for every program.** `IECLASS_POINTERPOS` warps the
+Intuition pointer, and Intuition applications follow it — Workbench, SysInfo,
+system requesters. Programs that read raw mouse *deltas* instead of asking
+Intuition where the pointer is never see the warp and keep their own cursor
+exactly where it was. SDL is the common case; ScummVM is the one that forced
+these ops into existence. The failure is quiet and misleading: the click is
+delivered, but at whatever position the program still believes the pointer
+holds, so the same wrong thing is clicked no matter where `MOVE` aims.
+
+`RMOVE` posts `IECLASS_RAWMOUSE` with `IEQUALIFIER_RELATIVEMOUSE` and a nonzero
+delta, which those programs do track. The delta is emitted in steps of at most
+32 pixels rather than one jump — `ie_X` would carry the whole distance, but
+programs that accumulate motion per event follow a run of modest steps far more
+predictably.
+
+`HOME` drives the pointer hard into the top-left corner (24 oversized negative
+steps). Overshooting is the point: both Intuition and SDL clamp at the edge, so
+a deliberate excess of travel makes the resulting position certain. `HOME`
+followed by `RMOVE dx,dy` is therefore absolute positioning built out of
+relative motion — which is what the client exposes as `input_point(x, y)`.
+
+Verified against ScummVM 2.0.1 on a 320×240 screen: deltas map **1:1** to that
+program's own cursor coordinates, no scaling needed.
+
+`dx`/`dy` are **signed**. Packing them unsigned sends 65216 where −320 was
+meant, and the pointer travels the wrong way across the screen.
 
 `CLICK` exists as its own op rather than three round trips because a click is
 move-then-press-then-release, and splitting that across three connections would
