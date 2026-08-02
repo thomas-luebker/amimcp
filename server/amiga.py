@@ -271,11 +271,28 @@ class Amiga:
     def input_button(self, button: str = "left", down: bool = True) -> None:
         self._request(CMD_INPUT, struct.pack(">BBB", IN_BUTTON, _button(button), 1 if down else 0))
 
-    def input_key(self, key: str | int, down: bool = True, qualifiers: int = 0) -> None:
-        self._request(
-            CMD_INPUT,
-            struct.pack(">BBBH", IN_KEY, _rawkey(key), 1 if down else 0, qualifiers),
-        )
+    def input_key(self, key: str | int, down: bool | None = None,
+                  qualifiers: int = 0) -> None:
+        """Send a keystroke — by default a complete press *and* release.
+
+        Pass `down=True` or `down=False` only when half an event is genuinely
+        wanted, such as holding a modifier across several other keys.
+
+        The default used to be press-only, which is a quiet trap: nothing fails
+        and nothing reports an error, the Amiga simply behaves as though a
+        finger is resting on the key. A single unreleased Escape put ScummVM
+        into permanent skip-cutscene state, where it ignores every mouse click —
+        which reads as "mouse injection is broken", not "a key is stuck".
+        """
+        code = _rawkey(key)
+        if down is None:
+            self._request(CMD_INPUT, struct.pack(">BBBH", IN_KEY, code, 1, qualifiers))
+            self._request(CMD_INPUT, struct.pack(">BBBH", IN_KEY, code, 0, qualifiers))
+        else:
+            self._request(
+                CMD_INPUT,
+                struct.pack(">BBBH", IN_KEY, code, 1 if down else 0, qualifiers),
+            )
 
     def input_text(self, text: str) -> None:
         # A tick per character on the Amiga side, so allow generous time.

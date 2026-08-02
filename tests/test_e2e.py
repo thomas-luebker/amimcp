@@ -244,6 +244,21 @@ class TestInput(Base):
         self.ami.input_key("return", down=True, qualifiers=0x0008)
         self.assertEqual(fake_agent.INPUT_LOG, [("key", 0x44, 1, 0x0008)])
 
+    def test_key_defaults_to_press_and_release(self):
+        # A press with no release leaves the key held on the Amiga, which fails
+        # silently and looks like something else entirely — a stuck Escape made
+        # ScummVM ignore every mouse click for an entire session.
+        self.ami.input_key("escape")
+        self.assertEqual(
+            fake_agent.INPUT_LOG,
+            [("key", 0x45, 1, 0), ("key", 0x45, 0, 0)],
+        )
+
+    def test_explicit_down_still_sends_half_an_event(self):
+        # Holding a modifier across other keys is a legitimate need.
+        self.ami.input_key("f1", down=True)
+        self.assertEqual(fake_agent.INPUT_LOG, [("key", 0x50, 1, 0)])
+
     def test_unknown_key_rejected_with_helpful_message(self):
         with self.assertRaises(AmigaError) as ctx:
             self.ami.input_key("banana")
