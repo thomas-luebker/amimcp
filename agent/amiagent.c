@@ -81,8 +81,15 @@ struct GfxBase *GfxBase = NULL;
 static UBYTE g_io[IOBUF];
 static char g_token[128];
 static int g_have_token = 0;
-static int g_quiet = 0;
+static int g_quiet = 1;   /* silent unless VERBOSE: see say() */
 
+/* Progress output is OFF by default, and that is a safety decision rather than
+ * a taste one. An AmigaShell pauses its output the moment someone clicks in
+ * the window to mark text; a process writing to it then blocks inside printf
+ * until a key is pressed. For a daemon that means the whole agent stops
+ * accepting connections because of a window nobody is looking at — which is
+ * exactly the wedge this daemon is supposed to not have. VERBOSE opts back in
+ * for interactive debugging. */
 static void say(const char *fmt, ...)
 {
     va_list ap;
@@ -1174,12 +1181,13 @@ static void serve(int sock)
  * Entry point
  * ------------------------------------------------------------------ */
 
-static const char *TEMPLATE = "PORT/N,TOKEN/K,QUIET/S";
+static const char *TEMPLATE = "PORT/N,TOKEN/K,QUIET/S,VERBOSE/S";
 
 struct args {
     LONG *port;
     STRPTR token;
-    LONG quiet;
+    LONG quiet;      /* accepted and ignored: quiet is now the default */
+    LONG verbose;
 };
 
 int main(void)
@@ -1198,7 +1206,7 @@ int main(void)
         return RETURN_FAIL;
     }
     if (a.port) port = (int)*a.port;
-    if (a.quiet) g_quiet = 1;
+    if (a.verbose) g_quiet = 0;
     if (a.token) {
         strncpy(g_token, (const char *)a.token, sizeof g_token - 1);
         g_token[sizeof g_token - 1] = '\0';
@@ -1236,8 +1244,13 @@ int main(void)
                "  network can run commands here. Restart with TOKEN=<secret>.\n",
                AMIAGENT_VERSION, port);
     else
-        say("amiagent %s: listening on port %d (token required)\n", AMIAGENT_VERSION, port);
-    say("Press Ctrl-C to stop.\n");
+        printf("amiagent %s: listening on port %d (token required)\n",
+               AMIAGENT_VERSION, port);
+    /* The banner always prints: it is one line, written before any client can
+     * connect, and without it a quiet-by-default daemon looks like it failed
+     * to start. Per-request chatter is what VERBOSE controls. */
+    printf("Press Ctrl-C to stop.%s\n", g_quiet ? "  (VERBOSE for per-command output)" : "");
+    fflush(stdout);
 
     for (;;) {
         struct sockaddr_in ca;
