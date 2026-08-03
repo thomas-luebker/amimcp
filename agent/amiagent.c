@@ -766,7 +766,9 @@ static int do_info(int sock)
  *
  * RECTFMT_RGB gives packed 24-bit RGB, which is already the wire format, so
  * there is nothing to repack. */
-static int shot_truecolor(int sock, struct RastPort *rp,
+static int screen_still_open(struct Screen *scr);   /* defined below */
+
+static int shot_truecolor(int sock, struct Screen *scr, struct RastPort *rp,
                           UWORD sx, UWORD sy, UWORD w, UWORD h)
 {
     ULONG rowbytes = (ULONG)w * 3UL;
@@ -787,10 +789,22 @@ static int shot_truecolor(int sock, struct RastPort *rp,
     pix = (UBYTE *)AllocVec(pixbytes, MEMF_ANY);
     if (!pix) return send_err(sock, "not enough memory for the screen buffer");
 
-    if (ReadPixelArray(pix, 0, 0, (UWORD)rowbytes, rp, sx, sy, w, h, RECTFMT_RGB) == 0) {
+    /* Buffer is already allocated, so the read itself can run with the task
+     * switcher held off — that is what makes the screen safe to touch. The
+     * slow part (pushing it down the socket) happens after Permit(). */
+    Forbid();
+    if (!screen_still_open(scr)) {
+        Permit();
+        FreeVec(pix);
+        return send_err(sock, "that screen closed while it was being captured");
+    }
+    ok = (ReadPixelArray(pix, 0, 0, (UWORD)rowbytes, rp, sx, sy, w, h, RECTFMT_RGB) != 0);
+    Permit();
+    if (!ok) {
         FreeVec(pix);
         return send_err(sock, "cybergraphics ReadPixelArray() failed");
     }
+    ok = 0;
 
     hdr[0] = SHOT_RGB24;
     hdr[1] = 0;
@@ -821,6 +835,22 @@ static struct Screen *nth_screen(UBYTE index)
         if (i == index) break;
     Permit();
     return s;
+}
+
+/* Is this screen still open? Call with the task switcher held off.
+ *
+ * A screen pointer taken under Forbid() and dereferenced after Permit() is a
+ * use-after-free waiting for its moment, and the moment is precisely when a
+ * program is starting up or dying — which is when something is most likely to
+ * be capturing the screen to find out what went wrong. Reading a freed Screen
+ * on AmigaOS does not fail politely; it takes the machine down. This agent
+ * crash-rebooted an A4000 doing exactly that while ScummVM opened its screen. */
+static int screen_still_open(struct Screen *scr)
+{
+    struct Screen *s;
+    for (s = IntuitionBase->FirstScreen; s; s = s->NextScreen)
+        if (s == scr) return 1;
+    return 0;
 }
 
 static int gfx_ready(int sock)
@@ -892,11 +922,26 @@ static int grab_chunky(int sock, struct Screen *scr,
     temprp.Layer = NULL;
     temprp.BitMap = tempbm;
 
-    if (ReadPixelArray8(rp, x, y, (UWORD)(x + w - 1), (UWORD)(y + h - 1),
-                        pix, &temprp) == -1) {
+    /* Both buffers exist by now, so nothing here needs to allocate — which
+     * means the read can run under Forbid() and the screen cannot vanish
+     * underneath it. Re-check it is still open first: it may already have
+     * closed between being looked up and getting here. */
+    Forbid();
+    if (!screen_still_open(scr)) {
+        Permit();
         FreeBitMap(tempbm);
         FreeVec(pix);
-        return send_err(sock, "ReadPixelArray8() failed");
+        return send_err(sock, "that screen closed while it was being captured");
+    }
+    {
+        LONG r = ReadPixelArray8(rp, x, y, (UWORD)(x + w - 1), (UWORD)(y + h - 1),
+                                 pix, &temprp);
+        Permit();
+        if (r == -1) {
+            FreeBitMap(tempbm);
+            FreeVec(pix);
+            return send_err(sock, "ReadPixelArray8() failed");
+        }
     }
     FreeBitMap(tempbm);
 
@@ -942,7 +987,7 @@ static int do_shot(int sock, const UBYTE *body, ULONG len)
 
     depth = (UWORD)GetBitMapAttr(scr->RastPort.BitMap, BMA_DEPTH);
     if (depth > 8)
-        return shot_truecolor(sock, &scr->RastPort, x, y, w, h);
+        return shot_truecolor(sock, scr, &scr->RastPort, x, y, w, h);
 
     if (!grab_chunky(sock, scr, x, y, w, h, &pix, pal, &ncolors)) return 0;
 
