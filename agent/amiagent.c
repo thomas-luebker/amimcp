@@ -766,7 +766,8 @@ static int do_info(int sock)
  *
  * RECTFMT_RGB gives packed 24-bit RGB, which is already the wire format, so
  * there is nothing to repack. */
-static int shot_truecolor(int sock, struct RastPort *rp, UWORD w, UWORD h)
+static int shot_truecolor(int sock, struct RastPort *rp,
+                          UWORD sx, UWORD sy, UWORD w, UWORD h)
 {
     ULONG rowbytes = (ULONG)w * 3UL;
     ULONG pixbytes = rowbytes * (ULONG)h;
@@ -786,7 +787,7 @@ static int shot_truecolor(int sock, struct RastPort *rp, UWORD w, UWORD h)
     pix = (UBYTE *)AllocVec(pixbytes, MEMF_ANY);
     if (!pix) return send_err(sock, "not enough memory for the screen buffer");
 
-    if (ReadPixelArray(pix, 0, 0, (UWORD)rowbytes, rp, 0, 0, w, h, RECTFMT_RGB) == 0) {
+    if (ReadPixelArray(pix, 0, 0, (UWORD)rowbytes, rp, sx, sy, w, h, RECTFMT_RGB) == 0) {
         FreeVec(pix);
         return send_err(sock, "cybergraphics ReadPixelArray() failed");
     }
@@ -807,21 +808,23 @@ static int shot_truecolor(int sock, struct RastPort *rp, UWORD w, UWORD h)
     return ok;
 }
 
-/* Grab the frontmost screen. Planar screens (depth <= 8) come back as palette
- * + chunky via ReadPixelArray8; RTG/truecolor goes through cybergraphics.
- * PNG encoding happens on the Mac — zlib has no business on a 68000. */
-static int do_shot(int sock)
+/* Screens are numbered front to back, so 0 is whatever is on top right now.
+ * Anything further back is still capturable, which matters when a program dies
+ * and leaves an empty screen in front of a perfectly healthy Workbench. */
+static struct Screen *nth_screen(UBYTE index)
 {
-    struct Screen *scr;
-    struct RastPort *rp, temprp;
-    struct BitMap *tempbm = NULL;
-    UWORD w, h, depth;
-    ULONG stride, pixbytes, palbytes, total;
-    UBYTE *pix = NULL, hdr[8];
-    UWORD ncolors = 0;
-    UBYTE pal[256 * 3];
-    int ok = 0;
+    struct Screen *s;
+    UBYTE i = 0;
 
+    Forbid();
+    for (s = IntuitionBase->FirstScreen; s; s = s->NextScreen, i++)
+        if (i == index) break;
+    Permit();
+    return s;
+}
+
+static int gfx_ready(int sock)
+{
 #ifdef AMIAGENT_OWN_LIBBASES
     if (!IntuitionBase)
         IntuitionBase = (struct IntuitionBase *)OpenLibrary((STRPTR)"intuition.library", 37);
@@ -832,21 +835,50 @@ static int do_shot(int sock)
         return send_err(sock, "intuition.library/graphics.library unavailable");
     if (((struct Library *)GfxBase)->lib_Version < 39)
         return send_err(sock, "screenshots need graphics.library v39+ (OS 3.0)");
+    return -1;   /* -1 means "fine"; 0 means an error was already sent */
+}
 
-    /* FirstScreen is the frontmost one, which is what you actually want to
-     * look at when something has gone wrong. */
-    Forbid();
-    scr = IntuitionBase->FirstScreen;
-    Permit();
-    if (!scr) return send_err(sock, "no screen open");
+/* Pull the optional region/screen selector off a CMD_SHOT or CMD_HASH payload
+ * and clamp it to the screen. An absent or zero width/height means "out to the
+ * edge", so an empty payload still reads as the whole screen. */
+static struct Screen *parse_region(int sock, const UBYTE *p, ULONG len,
+                                   UWORD *x, UWORD *y, UWORD *w, UWORD *h)
+{
+    struct Screen *scr;
+    UBYTE index = 0;
 
-    rp = &scr->RastPort;
-    w = scr->Width;
-    h = scr->Height;
-    depth = (UWORD)GetBitMapAttr(rp->BitMap, BMA_DEPTH);
+    if (len >= 9) index = p[8];
+    scr = nth_screen(index);
+    if (!scr) { send_err(sock, "no such screen"); return NULL; }
 
-    if (depth > 8)
-        return shot_truecolor(sock, rp, w, h);
+    *x = 0; *y = 0; *w = scr->Width; *h = scr->Height;
+    if (len >= 8) {
+        *x = (UWORD)((p[0] << 8) | p[1]);
+        *y = (UWORD)((p[2] << 8) | p[3]);
+        *w = (UWORD)((p[4] << 8) | p[5]);
+        *h = (UWORD)((p[6] << 8) | p[7]);
+    }
+    if (*x >= scr->Width || *y >= scr->Height) {
+        send_err(sock, "region starts outside the screen");
+        return NULL;
+    }
+    if (!*w || *x + *w > scr->Width)  *w = (UWORD)(scr->Width  - *x);
+    if (!*h || *y + *h > scr->Height) *h = (UWORD)(scr->Height - *y);
+    return scr;
+}
+
+/* Chunky (planar, depth <= 8) capture of one rectangle. Caller FreeVec()s
+ * *pix_out. Returns 0 having already sent an error, or 1 on success. */
+static int grab_chunky(int sock, struct Screen *scr,
+                       UWORD x, UWORD y, UWORD w, UWORD h,
+                       UBYTE **pix_out, UBYTE *pal, UWORD *ncolors_out)
+{
+    struct RastPort *rp = &scr->RastPort, temprp;
+    struct BitMap *tempbm;
+    UWORD depth = (UWORD)GetBitMapAttr(rp->BitMap, BMA_DEPTH);
+    UWORD ncolors, i;
+    ULONG stride, rgb[3];
+    UBYTE *pix;
 
     /* ReadPixelArray8 wants rows padded out to a multiple of 16 pixels. */
     stride = ((ULONG)w + 15UL) & ~15UL;
@@ -860,7 +892,8 @@ static int do_shot(int sock)
     temprp.Layer = NULL;
     temprp.BitMap = tempbm;
 
-    if (ReadPixelArray8(rp, 0, 0, w - 1, h - 1, pix, &temprp) == -1) {
+    if (ReadPixelArray8(rp, x, y, (UWORD)(x + w - 1), (UWORD)(y + h - 1),
+                        pix, &temprp) == -1) {
         FreeBitMap(tempbm);
         FreeVec(pix);
         return send_err(sock, "ReadPixelArray8() failed");
@@ -871,24 +904,49 @@ static int do_shot(int sock)
      * destination offset is always <= the source offset, so a forward copy is
      * safe even though the regions overlap. */
     if (stride != (ULONG)w) {
-        UWORD y;
-        for (y = 1; y < h; y++)
-            memmove(pix + (ULONG)y * w, pix + (ULONG)y * stride, w);
+        UWORD row;
+        for (row = 1; row < h; row++)
+            memmove(pix + (ULONG)row * w, pix + (ULONG)row * stride, w);
     }
-    pixbytes = (ULONG)w * (ULONG)h;
 
     ncolors = (UWORD)(1U << depth);
     if (ncolors > 256) ncolors = 256;
-    {
-        UWORD i;
-        ULONG rgb[3];
-        for (i = 0; i < ncolors; i++) {
-            GetRGB32(scr->ViewPort.ColorMap, i, 1, rgb);
-            pal[i * 3 + 0] = (UBYTE)(rgb[0] >> 24);
-            pal[i * 3 + 1] = (UBYTE)(rgb[1] >> 24);
-            pal[i * 3 + 2] = (UBYTE)(rgb[2] >> 24);
-        }
+    for (i = 0; i < ncolors; i++) {
+        GetRGB32(scr->ViewPort.ColorMap, i, 1, rgb);
+        pal[i * 3 + 0] = (UBYTE)(rgb[0] >> 24);
+        pal[i * 3 + 1] = (UBYTE)(rgb[1] >> 24);
+        pal[i * 3 + 2] = (UBYTE)(rgb[2] >> 24);
     }
+
+    *pix_out = pix;
+    *ncolors_out = ncolors;
+    return 1;
+}
+
+/* Grab a screen, or a rectangle of one. Planar screens (depth <= 8) come back
+ * as palette + chunky via ReadPixelArray8; RTG/truecolor goes through
+ * cybergraphics. PNG encoding happens on the Mac — zlib has no business on a
+ * 68000. */
+static int do_shot(int sock, const UBYTE *body, ULONG len)
+{
+    struct Screen *scr;
+    UWORD x, y, w, h, depth, ncolors = 0;
+    ULONG pixbytes, palbytes, total;
+    UBYTE *pix = NULL, hdr[8];
+    UBYTE pal[256 * 3];
+    int ok = 0;
+
+    if (!gfx_ready(sock)) return 0;
+    scr = parse_region(sock, body, len, &x, &y, &w, &h);
+    if (!scr) return 0;
+
+    depth = (UWORD)GetBitMapAttr(scr->RastPort.BitMap, BMA_DEPTH);
+    if (depth > 8)
+        return shot_truecolor(sock, &scr->RastPort, x, y, w, h);
+
+    if (!grab_chunky(sock, scr, x, y, w, h, &pix, pal, &ncolors)) return 0;
+
+    pixbytes = (ULONG)w * (ULONG)h;
     palbytes = (ULONG)ncolors * 3UL;
 
     hdr[0] = SHOT_CHUNKY;
@@ -898,7 +956,8 @@ static int do_shot(int sock)
     put_be16(hdr + 6, ncolors);
 
     total = 8 + palbytes + pixbytes;
-    say("shot: %ldx%ld depth %ld\n", (long)w, (long)h, (long)depth);
+    say("shot: %ldx%ld at %ld,%ld depth %ld\n",
+        (long)w, (long)h, (long)x, (long)y, (long)depth);
 
     if (send_hdr(sock, ST_OK, total) &&
         send_all(sock, hdr, 8) &&
@@ -908,6 +967,117 @@ static int do_shot(int sock)
 
     FreeVec(pix);
     return ok;
+}
+
+/* A checksum over a region, so a caller can poll "has this changed yet?"
+ * without paying for the pixels. Watching for a cutscene to end, or for a
+ * status line to update, is otherwise a stream of full frames pulled across
+ * the wire to compare a few hundred bytes. */
+static int do_hash(int sock, const UBYTE *body, ULONG len)
+{
+    struct Screen *scr;
+    UWORD x, y, w, h, depth, ncolors = 0;
+    UBYTE *pix = NULL, pal[256 * 3], out[4];
+    ULONG i, n, sum = 2166136261UL;   /* FNV-1a */
+
+    if (!gfx_ready(sock)) return 0;
+    scr = parse_region(sock, body, len, &x, &y, &w, &h);
+    if (!scr) return 0;
+
+    depth = (UWORD)GetBitMapAttr(scr->RastPort.BitMap, BMA_DEPTH);
+    if (depth > 8) {
+        ULONG rowbytes = (ULONG)w * 3UL;
+        if (!CyberGfxBase)
+            CyberGfxBase = OpenLibrary((STRPTR)"cybergraphics.library", 40);
+        if (!CyberGfxBase)
+            return send_err(sock, "truecolor screen needs cybergraphics.library v40+");
+        n = rowbytes * (ULONG)h;
+        pix = (UBYTE *)AllocVec(n, MEMF_ANY);
+        if (!pix) return send_err(sock, "not enough memory for the region buffer");
+        if (ReadPixelArray(pix, 0, 0, (UWORD)rowbytes, &scr->RastPort,
+                           x, y, w, h, RECTFMT_RGB) == 0) {
+            FreeVec(pix);
+            return send_err(sock, "cybergraphics ReadPixelArray() failed");
+        }
+    } else {
+        if (!grab_chunky(sock, scr, x, y, w, h, &pix, pal, &ncolors)) return 0;
+        n = (ULONG)w * (ULONG)h;
+    }
+
+    for (i = 0; i < n; i++) {
+        sum ^= pix[i];
+        sum *= 16777619UL;
+    }
+    FreeVec(pix);
+
+    put_be32(out, sum);
+    say("hash: %ldx%ld at %ld,%ld\n", (long)w, (long)h, (long)x, (long)y);
+    return send_hdr(sock, ST_OK, 4) && send_all(sock, out, 4);
+}
+
+/* Every open screen, front to back. Dimensions and mode let the client work
+ * out its own coordinate mapping instead of discovering it by trial. */
+/* Static, not on the stack. An AmigaOS process gets a few KB of stack and this
+ * reply buffer is 800-odd bytes; making it local silently overflowed and hung
+ * the agent inside the handler, so it never returned to its accept loop. The
+ * daemon handles one connection at a time in this process, so a single shared
+ * buffer is safe. */
+#define MAX_SCREENS 16
+static UBYTE g_screenbuf[1 + MAX_SCREENS * (1 + 2 + 2 + 1 + 4 + 1 + 40)];
+
+static int do_screens(int sock)
+{
+    struct Screen *s;
+    UBYTE *buf = g_screenbuf;
+    ULONG at = 1;
+    UBYTE count = 0;
+
+    if (!gfx_ready(sock)) return 0;
+
+    Forbid();
+    for (s = IntuitionBase->FirstScreen; s && count < MAX_SCREENS; s = s->NextScreen) {
+        const char *title = (const char *)s->Title;
+        UBYTE tlen = 0;
+        if (title) while (tlen < 40 && title[tlen]) tlen++;
+
+        buf[at++] = count;
+        put_be16(buf + at, (UWORD)s->Width);  at += 2;
+        put_be16(buf + at, (UWORD)s->Height); at += 2;
+        buf[at++] = (UBYTE)GetBitMapAttr(s->RastPort.BitMap, BMA_DEPTH);
+        put_be32(buf + at, GetVPModeID(&s->ViewPort)); at += 4;
+        buf[at++] = tlen;
+        if (tlen) { memcpy(buf + at, title, tlen); at += tlen; }
+        count++;
+    }
+    Permit();
+
+    buf[0] = count;
+    say("screens: %ld\n", (long)count);
+    return send_hdr(sock, ST_OK, at) && send_all(sock, buf, at);
+}
+
+/* Where is the pointer? Cheap enough to ask before every click.
+ *
+ * This is Intuition's pointer. A program that tracks raw mouse deltas keeps a
+ * cursor of its own that nothing else can see, so agreement here is necessary
+ * but not sufficient when driving one of those. */
+static int do_pointer(int sock)
+{
+    struct Screen *scr;
+    UBYTE out[8];
+
+    if (!gfx_ready(sock)) return 0;
+    scr = nth_screen(0);
+    if (!scr) return send_err(sock, "no screen open");
+
+    Forbid();
+    put_be16(out + 0, (UWORD)scr->MouseX);
+    put_be16(out + 2, (UWORD)scr->MouseY);
+    put_be16(out + 4, (UWORD)scr->Width);
+    put_be16(out + 6, (UWORD)scr->Height);
+    Permit();
+
+    return send_hdr(sock, ST_OK, 8) && send_all(sock, out, 8);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1129,6 +1299,58 @@ static int do_input(int sock, const UBYTE *p, ULONG len)
         input_home();
         break;
 
+    /* A whole sequence in one request, so the gaps between events are the
+     * Amiga's own ticks rather than however long each round trip took. Sending
+     * a press and a release as two requests puts hundreds of milliseconds
+     * between them, which programs read as a held button rather than a click —
+     * that is a real bug, not a theoretical one. */
+    case IN_SCRIPT: {
+        UBYTE n, i;
+        ULONG at = 1;
+        if (!len) return send_err(sock, "SCRIPT needs a count");
+        n = p[0];
+        for (i = 0; i < n; i++) {
+            UBYTE op2;
+            if (at >= len) return send_err(sock, "SCRIPT ended early");
+            op2 = p[at++];
+            switch (op2) {
+            case IN_MOVE:
+                if (at + 4 > len) return send_err(sock, "SCRIPT MOVE needs x,y");
+                input_move((WORD)((p[at] << 8) | p[at+1]),
+                           (WORD)((p[at+2] << 8) | p[at+3]));
+                at += 4;
+                break;
+            case IN_BUTTON:
+                if (at + 2 > len) return send_err(sock, "SCRIPT BUTTON needs button,down");
+                input_button(p[at], p[at+1]);
+                at += 2;
+                break;
+            case IN_KEY:
+                if (at + 4 > len) return send_err(sock, "SCRIPT KEY needs rawcode,down,qualifier");
+                input_key(p[at], p[at+1], (UWORD)((p[at+2] << 8) | p[at+3]));
+                at += 4;
+                break;
+            case IN_RMOVE:
+                if (at + 4 > len) return send_err(sock, "SCRIPT RMOVE needs dx,dy");
+                input_rmove((WORD)((p[at] << 8) | p[at+1]),
+                            (WORD)((p[at+2] << 8) | p[at+3]));
+                at += 4;
+                break;
+            case IN_HOME:
+                input_home();
+                break;
+            case INS_WAIT:
+                if (at + 2 > len) return send_err(sock, "SCRIPT WAIT needs ticks");
+                Delay((ULONG)((p[at] << 8) | p[at+1]));
+                at += 2;
+                break;
+            default:
+                return send_err(sock, "unknown SCRIPT sub-op");
+            }
+        }
+        break;
+    }
+
     case IN_CLICK: {
         UBYTE button, count, n;
         if (len < 6) return send_err(sock, "CLICK needs x,y,button,count");
@@ -1223,7 +1445,10 @@ static void serve(int sock)
         case CMD_PUT:  do_put(sock, body, got, len); break;
         case CMD_LIST: do_list(sock, body, len); break;
         case CMD_INFO: do_info(sock); break;
-        case CMD_SHOT: do_shot(sock); break;
+        case CMD_SHOT: do_shot(sock, body, len); break;
+        case CMD_HASH: do_hash(sock, body, len); break;
+        case CMD_SCREENS: do_screens(sock); break;
+        case CMD_POINTER: do_pointer(sock); break;
         case CMD_INPUT: do_input(sock, body, len); break;
         case CMD_BREAK: do_break(sock); break;
         default:       send_err(sock, "unknown command"); break;

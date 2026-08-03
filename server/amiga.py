@@ -24,6 +24,9 @@ CMD_INFO = 0x06
 CMD_SHOT = 0x07
 CMD_INPUT = 0x08
 CMD_BREAK = 0x09
+CMD_SCREENS = 0x0A
+CMD_POINTER = 0x0B
+CMD_HASH = 0x0C
 CMD_AUTH = 0x10
 
 # CMD_INPUT ops (see agent/proto.h)
@@ -34,6 +37,8 @@ IN_TEXT = 4
 IN_CLICK = 5
 IN_RMOVE = 6
 IN_HOME = 7
+IN_SCRIPT = 8
+INS_WAIT = 9
 
 BUTTONS = {"left": 0, "right": 1, "middle": 2}
 
@@ -328,8 +333,106 @@ class Amiga:
         self.input_home()
         self.input_move_rel(x, y)
 
-    def screenshot(self, timeout: float = 60.0) -> Screenshot:
-        body = self._request(CMD_SHOT, timeout=timeout)
+    def input_script(self, events: list[tuple]) -> None:
+        """Run a sequence of input events in ONE request.
+
+        Each event is a tuple: ("move", x, y), ("rmove", dx, dy),
+        ("button", name, down), ("key", key, down, quals), ("home",),
+        ("wait", ticks) — one tick is 1/50 s.
+
+        Every other input call opens its own connection, so a press and a
+        release land hundreds of milliseconds apart and programs read that as a
+        held button rather than a click. Here the gaps are the Amiga's own
+        ticks, which is what drags and double-clicks actually need.
+        """
+        out = bytearray([IN_SCRIPT, len(events)])
+        for ev in events:
+            kind = ev[0]
+            if kind == "move":
+                out += struct.pack(">BHH", IN_MOVE, ev[1], ev[2])
+            elif kind == "rmove":
+                out += struct.pack(">Bhh", IN_RMOVE, ev[1], ev[2])
+            elif kind == "button":
+                out += struct.pack(">BBB", IN_BUTTON, _button(ev[1]), 1 if ev[2] else 0)
+            elif kind == "key":
+                out += struct.pack(">BBBH", IN_KEY, _rawkey(ev[1]),
+                                   1 if ev[2] else 0, ev[3] if len(ev) > 3 else 0)
+            elif kind == "home":
+                out += bytes([IN_HOME])
+            elif kind == "wait":
+                out += struct.pack(">BH", INS_WAIT, ev[1])
+            else:
+                raise AmigaError(f"unknown script event {kind!r}")
+        ticks = sum(e[1] for e in events if e[0] == "wait")
+        self._request(CMD_INPUT, bytes(out),
+                      timeout=max(self.timeout, 10 + ticks / 50.0 + len(events)))
+
+    def click_at(self, x: int, y: int, button: str = "left",
+                 relative: bool = False) -> None:
+        """Position and click as one atomic sequence.
+
+        `relative=True` homes the pointer and moves by a delta instead of
+        warping, for programs that ignore pointer warps (SDL).
+        """
+        move = [("home",), ("rmove", x, y)] if relative else [("move", x, y)]
+        self.input_script(move + [("wait", 4), ("button", button, True),
+                                  ("wait", 2), ("button", button, False)])
+
+    # -- looking at the machine --------------------------------------------
+
+    def screens(self) -> list[dict]:
+        """Every open screen, front to back. Index 0 is frontmost.
+
+        Worth having for two reasons: the client can derive its coordinate
+        mapping from real dimensions instead of guessing, and a crashed program
+        that leaves a blank screen in front no longer hides a healthy Workbench
+        behind it — capture it by index.
+        """
+        body = self._request(CMD_SCREENS)
+        if not body:
+            raise AmigaUnreachable("empty screen list")
+        out, at = [], 1
+        for _ in range(body[0]):
+            index, w, h, depth, modeid, tlen = struct.unpack(">BHHBIB", body[at:at + 11])
+            at += 11
+            title = body[at:at + tlen].decode("latin-1"); at += tlen
+            out.append({"index": index, "width": w, "height": h,
+                        "depth": depth, "modeid": modeid, "title": title})
+        return out
+
+    def pointer(self) -> dict:
+        """Where Intuition's pointer is, and the screen it is on.
+
+        Cheap enough to ask before every click. Note a program tracking raw
+        mouse deltas keeps its own cursor that this cannot see.
+        """
+        body = self._request(CMD_POINTER)
+        x, y, w, h = struct.unpack(">HHHH", body[:8])
+        return {"x": x, "y": y, "screen_width": w, "screen_height": h}
+
+    def region_hash(self, x: int = 0, y: int = 0, w: int = 0, h: int = 0,
+                    screen: int = 0) -> int:
+        """Checksum of a screen region — "has this changed?" without the pixels.
+
+        Polling for a cutscene to finish or a status line to update otherwise
+        means dragging whole frames across the wire to compare a few hundred
+        bytes.
+        """
+        return struct.unpack(">I", self._request(
+            CMD_HASH, struct.pack(">HHHHB", x, y, w, h, screen)))[0]
+
+    def screenshot(self, timeout: float = 60.0, x: int = 0, y: int = 0,
+                   w: int = 0, h: int = 0, screen: int = 0) -> Screenshot:
+        """Capture a screen, or just a rectangle of one.
+
+        A region is not a micro-optimisation. Reading a 320x14 status line out
+        of a 1920x1080 truecolour frame moves ~6 MB over a ~1 MB/s link to
+        answer a 4 KB question, and that ratio is the difference between
+        watching a program and keeping up with it.
+        """
+        payload = b"" if not (x or y or w or h or screen) else \
+            struct.pack(">HHHHB", x, y, w, h, screen)
+        body = self._request(CMD_SHOT, payload, timeout=timeout)
         if len(body) < 8:
             raise AmigaUnreachable("truncated screenshot response")
         fmt, _rsvd, width, height, ncolors = struct.unpack(">BBHHH", body[:8])

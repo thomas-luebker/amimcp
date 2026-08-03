@@ -230,6 +230,36 @@ class TestInput(Base):
         self.ami.input_home()
         self.assertEqual(fake_agent.INPUT_LOG, [("home",)])
 
+    def test_script_runs_events_in_order_in_one_request(self):
+        # The whole point: press and release inside one request, so the gap
+        # between them is the Amiga's own ticks rather than a TCP round trip.
+        self.ami.input_script([("move", 10, 20), ("wait", 4),
+                               ("button", "left", True), ("wait", 2),
+                               ("button", "left", False)])
+        self.assertEqual(fake_agent.INPUT_LOG, [
+            ("script", 5), ("move", 10, 20), ("wait", 4),
+            ("button", 0, 1), ("wait", 2), ("button", 0, 0),
+        ])
+
+    def test_click_at_is_atomic(self):
+        self.ami.click_at(64, 32)
+        self.assertEqual(fake_agent.INPUT_LOG[0], ("script", 5))
+        self.assertIn(("move", 64, 32), fake_agent.INPUT_LOG)
+        self.assertIn(("button", 0, 1), fake_agent.INPUT_LOG)
+        self.assertIn(("button", 0, 0), fake_agent.INPUT_LOG)
+
+    def test_click_at_relative_homes_first(self):
+        # For programs that ignore pointer warps, the delta must be measured
+        # from a known corner — so HOME has to come before the move.
+        self.ami.click_at(30, 40, relative=True)
+        kinds = [e[0] for e in fake_agent.INPUT_LOG]
+        self.assertLess(kinds.index("home"), kinds.index("rmove"))
+
+    def test_script_rejects_unknown_event_client_side(self):
+        with self.assertRaises(AmigaError):
+            self.ami.input_script([("teleport", 1, 2)])
+        self.assertEqual(fake_agent.INPUT_LOG, [])
+
     def test_point_is_home_then_relative(self):
         # Absolute positioning for programs that ignore pointer warps: the
         # order matters, since the delta is measured from the corner.
@@ -500,3 +530,42 @@ class TestMCP(Base):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestRegionCaptureAndProbes(Base):
+    """The cheap-observation ops: region capture, hashing, screens, pointer."""
+
+    def test_region_capture_returns_only_that_rectangle(self):
+        s = self.ami.screenshot(x=40, y=50, w=64, h=32)
+        self.assertEqual((s.width, s.height), (64, 32))
+        self.assertEqual(len(s.pixels), 64 * 32)
+
+    def test_region_is_a_genuine_crop_not_a_resize(self):
+        # The same pixel must read the same whether captured whole or cropped —
+        # otherwise a region is a different picture, not a cheaper one.
+        full = self.ami.screenshot()
+        crop = self.ami.screenshot(x=40, y=50, w=64, h=32)
+        self.assertEqual(crop.pixels[0], full.pixels[50 * full.width + 40])
+        self.assertEqual(crop.pixels[10 * 64 + 5],
+                         full.pixels[(50 + 10) * full.width + (40 + 5)])
+
+    def test_zero_width_means_out_to_the_edge(self):
+        full = self.ami.screenshot()
+        s = self.ami.screenshot(x=100, y=0, w=0, h=0)
+        self.assertEqual(s.width, full.width - 100)
+
+    def test_region_hash_is_stable_and_position_dependent(self):
+        a = self.ami.region_hash(0, 0, 32, 16)
+        self.assertEqual(a, self.ami.region_hash(0, 0, 32, 16))
+        self.assertNotEqual(a, self.ami.region_hash(64, 48, 32, 16))
+
+    def test_screens_lists_front_to_back(self):
+        rows = self.ami.screens()
+        self.assertEqual([r["index"] for r in rows], [0, 1])
+        self.assertEqual(rows[0]["title"], "Game")
+        self.assertEqual((rows[1]["width"], rows[1]["height"]), (1920, 1080))
+
+    def test_pointer_reports_position_and_its_screen(self):
+        p = self.ami.pointer()
+        self.assertEqual((p["x"], p["y"]), (100, 50))
+        self.assertEqual((p["screen_width"], p["screen_height"]), (640, 256))

@@ -28,9 +28,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from amiga import (  # noqa: E402
     CMD_AUTH, CMD_BREAK, CMD_EXEC, CMD_GET, CMD_INFO, CMD_INPUT, CMD_LIST,
-    CMD_PING, CMD_PUT, CMD_SHOT, HDRLEN, IN_BUTTON, IN_CLICK, IN_HOME, IN_KEY,
-    IN_MOVE, IN_RMOVE,
-    IN_TEXT, MAGIC, SHOT_CHUNKY, SHOT_RGB24, ST_AUTH, ST_ERR, ST_OK,
+    CMD_HASH, CMD_PING, CMD_POINTER, CMD_PUT, CMD_SCREENS, CMD_SHOT, HDRLEN,
+    IN_BUTTON, IN_CLICK, IN_HOME, IN_KEY, IN_MOVE, IN_RMOVE, IN_SCRIPT,
+    INS_WAIT, IN_TEXT, MAGIC, SHOT_CHUNKY, SHOT_RGB24, ST_AUTH, ST_ERR, ST_OK,
 )
 
 # Every input event the fake agent is asked to inject, so tests can assert on
@@ -101,23 +101,53 @@ def fake_shell(command: str) -> tuple[int, str]:
     return 205, f"{parts[0]}: unknown command (fake_agent implements a subset)\n"
 
 
-def fake_screenshot() -> bytes:
+def fake_screenshot(region=None) -> bytes:
     """A 320x200 16-colour test pattern, in the SHOT_CHUNKY payload layout."""
-    w, h, ncolors = 320, 200, 16
+    sw, sh, ncolors = 320, 200, 16
+    ox = oy = 0
+    w, h = sw, sh
+    if region:
+        ox, oy, rw, rh, _scr = region
+        w, h = (rw or sw - ox), (rh or sh - oy)
     palette = bytearray()
     for i in range(ncolors):
         palette += bytes(((i * 17) & 0xFF, (i * 11) & 0xFF, (i * 23) & 0xFF))
     pixels = bytearray(w * h)
     for y in range(h):
         for x in range(w):
-            pixels[y * w + x] = ((x // 20) + (y // 25)) % ncolors
+            # keyed off absolute screen position, so a region really is a crop
+            pixels[y * w + x] = (((x + ox) // 20) + ((y + oy) // 25)) % ncolors
     hdr = struct.pack(">BBHHH", SHOT_CHUNKY, 0, w, h, ncolors)
     return hdr + bytes(palette) + bytes(pixels)
 
 
-def fake_truecolor_shot() -> bytes:
+def fake_screens() -> bytes:
+    """Two screens, front to back — enough to exercise indexing."""
+    out = bytearray([2])
+    for i, (w, h, d, mode, title) in enumerate(
+            [(640, 256, 4, 0x8000, "Game"), (1920, 1080, 24, 0x50001, "Workbench")]):
+        out += struct.pack(">BHHBIB", i, w, h, d, mode, len(title))
+        out += title.encode("latin-1")
+    return bytes(out)
+
+
+def fake_hash(region=None) -> int:
+    """FNV-1a over the same pixels a shot would return, so a changed region
+    genuinely changes the hash."""
+    body = fake_truecolor_shot(region) if TRUECOLOR else fake_screenshot(region)
+    px = body[8:]
+    h = 2166136261
+    for b in px:
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def fake_truecolor_shot(region=None) -> bytes:
     """A 64x32 RGB24 payload, in the SHOT_RGB24 layout."""
     w, h = 64, 32
+    if region:
+        rx, ry, rw, rh, _scr = region
+        w, h = (rw or 64 - rx), (rh or 32 - ry)
     px = bytearray()
     for y in range(h):
         for x in range(w):
@@ -143,6 +173,26 @@ def fake_input(body: bytes) -> None:
         INPUT_LOG.append(("rmove", *struct.unpack(">hh", p[:4])))
     elif op == IN_HOME:
         INPUT_LOG.append(("home",))
+    elif op == IN_SCRIPT:
+        n, at = p[0], 1
+        INPUT_LOG.append(("script", n))
+        for _ in range(n):
+            sub = p[at]; at += 1
+            if sub == IN_MOVE:
+                INPUT_LOG.append(("move", *struct.unpack(">HH", p[at:at+4]))); at += 4
+            elif sub == IN_RMOVE:
+                INPUT_LOG.append(("rmove", *struct.unpack(">hh", p[at:at+4]))); at += 4
+            elif sub == IN_BUTTON:
+                INPUT_LOG.append(("button", p[at], p[at+1])); at += 2
+            elif sub == IN_KEY:
+                INPUT_LOG.append(("key", p[at], p[at+1],
+                                  struct.unpack(">H", p[at+2:at+4])[0])); at += 4
+            elif sub == IN_HOME:
+                INPUT_LOG.append(("home",))
+            elif sub == INS_WAIT:
+                INPUT_LOG.append(("wait", struct.unpack(">H", p[at:at+2])[0])); at += 2
+            else:
+                raise ValueError(f"unknown script sub-op {sub}")
     else:
         raise ValueError(f"unknown input op {op}")
 
@@ -288,7 +338,16 @@ class Handler(socketserver.BaseRequestHandler):
             elif code == CMD_INFO:
                 self.reply(ST_OK, fake_info())
             elif code == CMD_SHOT:
-                self.reply(ST_OK, fake_truecolor_shot() if TRUECOLOR else fake_screenshot())
+                region = struct.unpack(">HHHHB", body[:9]) if len(body) >= 9 else None
+                self.reply(ST_OK, fake_truecolor_shot(region) if TRUECOLOR
+                           else fake_screenshot(region))
+            elif code == CMD_SCREENS:
+                self.reply(ST_OK, fake_screens())
+            elif code == CMD_POINTER:
+                self.reply(ST_OK, struct.pack(">HHHH", 100, 50, 640, 256))
+            elif code == CMD_HASH:
+                region = struct.unpack(">HHHHB", body[:9]) if len(body) >= 9 else None
+                self.reply(ST_OK, struct.pack(">I", fake_hash(region)))
             elif code == CMD_INPUT:
                 fake_input(body)
                 self.reply(ST_OK)

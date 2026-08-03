@@ -166,6 +166,56 @@ TOOLS = [
                     "type": "number",
                     "description": "JPEG quality 1-100 when format is 'jpeg'. Default 85. JPEG needs jpeg.library installed on the Amiga.",
                 },
+                "x": {"type": "number", "description": "Left edge of a sub-rectangle to capture."},
+                "y": {"type": "number", "description": "Top edge of a sub-rectangle to capture."},
+                "w": {"type": "number", "description": "Width of the rectangle; 0 or omitted means out to the screen edge."},
+                "h": {"type": "number", "description": "Height of the rectangle; 0 or omitted means out to the screen edge."},
+                "screen": {
+                    "type": "number",
+                    "description": (
+                        "Which screen to capture, 0 = frontmost (default). Use amiga_screens "
+                        "to list them. Needed when a crashed program leaves a blank screen in "
+                        "front of a working Workbench."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "name": "amiga_screens",
+        "description": (
+            "List the Amiga's open screens, front to back, with dimensions, depth "
+            "and title. Use this before capturing or clicking on an unfamiliar "
+            "display: it tells you the real geometry instead of guessing, and it "
+            "reveals a healthy Workbench hiding behind a crashed program's screen."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "amiga_pointer",
+        "description": (
+            "Report where the Amiga's mouse pointer currently is, and the size of "
+            "the screen it is on. Cheap — no image is transferred. Use it to check "
+            "the pointer landed where you aimed before clicking. Note this is "
+            "Intuition's pointer: a program that tracks raw mouse deltas (SDL "
+            "games, ScummVM) keeps its own cursor that this cannot see."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "amiga_region_changed",
+        "description": (
+            "Return a checksum of a screen region without transferring the pixels. "
+            "Call it twice and compare to answer 'has anything changed yet?' — the "
+            "right way to wait for a program to finish drawing, a cutscene to end, "
+            "or a status line to update, instead of pulling whole screenshots."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number"}, "y": {"type": "number"},
+                "w": {"type": "number"}, "h": {"type": "number"},
+                "screen": {"type": "number", "description": "0 = frontmost (default)."},
             },
         },
     },
@@ -199,6 +249,16 @@ TOOLS = [
                 "button": {"type": "string", "enum": ["left", "right", "middle"],
                            "description": "Default 'left'."},
                 "count": {"type": "number", "description": "1 for a single click, 2 to double-click. Default 1."},
+                "relative": {
+                    "type": "boolean",
+                    "description": (
+                        "Position by homing the pointer to the corner and moving by a "
+                        "delta, rather than warping it. Needed for SDL programs and "
+                        "games (ScummVM), which keep their own cursor and never see a "
+                        "warp — a warp-then-click there lands wherever that program "
+                        "last thought the pointer was, silently clicking the wrong thing."
+                    ),
+                },
             },
             "required": ["x", "y"],
         },
@@ -207,13 +267,22 @@ TOOLS = [
         "name": "amiga_move_mouse",
         "description": (
             "Move the Amiga's mouse pointer without clicking. Useful to hover, "
-            "or to park the pointer somewhere harmless before a screenshot."
+            "or to park the pointer somewhere harmless before a screenshot. "
+            "Set relative:true for SDL programs and games — see amiga_click."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "x": {"type": "number", "description": "Absolute screen X in pixels."},
                 "y": {"type": "number", "description": "Absolute screen Y in pixels."},
+                "relative": {
+                    "type": "boolean",
+                    "description": (
+                        "Reach (x, y) by homing the pointer to the top-left corner and "
+                        "moving by that delta, instead of warping. Required for programs "
+                        "that read raw mouse deltas rather than asking Intuition."
+                    ),
+                },
             },
             "required": ["x", "y"],
         },
@@ -400,18 +469,23 @@ def tool_screenshot(ami: Amiga, args: dict) -> list[dict]:
     method = args.get("method", "auto")
     fmt = args.get("format", "png")
     quality = int(args.get("quality", 85))
+    rx, ry = int(args.get("x", 0)), int(args.get("y", 0))
+    rw, rh = int(args.get("w", 0)), int(args.get("h", 0))
+    screen = int(args.get("screen", 0))
+    region = bool(rx or ry or rw or rh or screen)
     native_err = None
 
     # The agent's built-in capture is faster and needs nothing installed, but
     # only understands planar screens. Try it first, fall back to SGrab.
     if method in ("auto", "native"):
         try:
-            shot = ami.screenshot()
+            shot = ami.screenshot(x=rx, y=ry, w=rw, h=rh, screen=screen)
             data = png.screenshot_png(shot)
             kind = "truecolor" if shot.palette is None else f"{len(shot.palette)}-colour"
+            where = (f"Region {rx},{ry} {shot.width}x{shot.height} of screen {screen}"
+                     if region else f"Frontmost screen: {shot.width}x{shot.height}")
             return [
-                {"type": "text",
-                 "text": f"Frontmost screen: {shot.width}x{shot.height}, {kind} (native capture)."},
+                {"type": "text", "text": f"{where}, {kind} (native capture)."},
                 {"type": "image",
                  "data": base64.b64encode(data).decode("ascii"),
                  "mimeType": "image/png"},
@@ -460,15 +534,57 @@ def tool_click(ami: Amiga, args: dict) -> list[dict]:
     x, y = int(args["x"]), int(args["y"])
     button = args.get("button", "left")
     count = int(args.get("count", 1))
-    ami.input_click(x, y, button, count)
+    relative = bool(args.get("relative", False))
+
+    if relative:
+        # Position by delta from a known corner and click atomically, because
+        # the programs that need this also ignore pointer warps entirely.
+        for _ in range(count):
+            ami.click_at(x, y, button, relative=True)
+        how = " (relative positioning)"
+    else:
+        ami.input_click(x, y, button, count)
+        how = ""
     what = "double-clicked" if count == 2 else "clicked"
-    return [{"type": "text", "text": f"{what} {button} at ({x}, {y})."}]
+    return [{"type": "text", "text": f"{what} {button} at ({x}, {y}){how}."}]
 
 
 def tool_move_mouse(ami: Amiga, args: dict) -> list[dict]:
     x, y = int(args["x"]), int(args["y"])
+    if args.get("relative"):
+        ami.input_point(x, y)
+        return [{"type": "text", "text": f"Pointer moved to ({x}, {y}) by relative motion."}]
     ami.input_move(x, y)
     return [{"type": "text", "text": f"Pointer moved to ({x}, {y})."}]
+
+
+def tool_screens(ami: Amiga, args: dict) -> list[dict]:
+    rows = ami.screens()
+    if not rows:
+        return [{"type": "text", "text": "No screens open."}]
+    lines = ["Open screens, front to back:"]
+    for r in rows:
+        lines.append(
+            f"  [{r['index']}] {r['width']}x{r['height']} depth {r['depth']} "
+            f"mode 0x{r['modeid']:08X}  {r['title'] or '(untitled)'}"
+        )
+    return [{"type": "text", "text": "\n".join(lines)}]
+
+
+def tool_pointer(ami: Amiga, args: dict) -> list[dict]:
+    p = ami.pointer()
+    return [{"type": "text", "text": (
+        f"Pointer at ({p['x']}, {p['y']}) on a "
+        f"{p['screen_width']}x{p['screen_height']} screen. "
+        "This is Intuition's pointer; SDL programs keep their own cursor."
+    )}]
+
+
+def tool_region_changed(ami: Amiga, args: dict) -> list[dict]:
+    h = ami.region_hash(int(args.get("x", 0)), int(args.get("y", 0)),
+                        int(args.get("w", 0)), int(args.get("h", 0)),
+                        int(args.get("screen", 0)))
+    return [{"type": "text", "text": f"region checksum: {h:08x}"}]
 
 
 def tool_type(ami: Amiga, args: dict) -> list[dict]:
@@ -499,6 +615,9 @@ HANDLERS = {
     "amiga_write_file": tool_write_file,
     "amiga_list_dir": tool_list_dir,
     "amiga_screenshot": tool_screenshot,
+    "amiga_screens": tool_screens,
+    "amiga_pointer": tool_pointer,
+    "amiga_region_changed": tool_region_changed,
     "amiga_system_info": tool_system_info,
 }
 
