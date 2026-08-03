@@ -78,6 +78,12 @@ struct GfxBase *GfxBase = NULL;
 
 #define IOBUF 8192
 
+/* Stack for the process a command runs in. Workbench icons routinely ask for
+ * 100 KB and more; 16 KB was enough for AmigaDOS commands and nothing else,
+ * and quietly wrecked anything larger. Memory is not the constraint here — the
+ * target machine has hundreds of megabytes — so be generous. */
+#define AMIAGENT_CMD_STACK 262144
+
 static UBYTE g_io[IOBUF];
 static char g_token[128];
 static int g_have_token = 0;
@@ -345,10 +351,22 @@ static void job_entry(void)
     if (j->have_err) err = Open((STRPTR)j->errname, MODE_NEWFILE);
 
     if (in && out)
+        /* NP_StackSize is passed straight through to the process SystemTags
+         * creates for the command. It matters far more than it looks: a
+         * command inherits this stack, and a GUI program given too little
+         * does not fail politely on a 68k — it walks off the end of the stack
+         * and takes the machine down.
+         *
+         * ScummVM launched from here crash-rebooted an A4000 repeatedly while
+         * the same binary started fine from Workbench, because an icon
+         * specifies its own stack and this did not. `ScummVM --version`
+         * always worked, which is exactly the tell: it exits before the call
+         * depth grows. */
         j->rc = SystemTags((STRPTR)j->cmd,
                            SYS_Input, (ULONG)in,
                            SYS_Output, (ULONG)out,
                            err ? SYS_Error : TAG_IGNORE, (ULONG)err,
+                           NP_StackSize, AMIAGENT_CMD_STACK,
                            TAG_DONE);
 
     /* Ours to close — see the dos.library autodoc note in PROTOCOL.md. */
@@ -452,7 +470,7 @@ static int do_exec(int sock, const UBYTE *payload, ULONG len)
     g_job.busy = 1;
     g_job.proc = CreateNewProcTags(NP_Entry, (ULONG)job_entry,
                                    NP_Name, (ULONG)"amiagent-command",
-                                   NP_StackSize, 16384,
+                                   NP_StackSize, AMIAGENT_CMD_STACK,
                                    TAG_DONE);
     if (!g_job.proc) {
         g_job.busy = 0;

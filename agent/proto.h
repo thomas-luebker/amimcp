@@ -110,6 +110,6 @@
 #define SHOT_CHUNKY 1   /* palette + 1 byte/pixel */
 #define SHOT_RGB24  2   /* 3 bytes/pixel, no palette */
 
-#define AMIAGENT_VERSION "0.5.1"
+#define AMIAGENT_VERSION "0.5.2"
 
 #endif /* AMIMCP_PROTO_H */
