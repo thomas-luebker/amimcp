@@ -279,16 +279,32 @@ static ULONG file_size(BPTR fh)
     return end > 0 ? (ULONG)end : 0;
 }
 
-/* Stream `len` bytes of `fh` to the socket. */
+/* Read through a big temporary buffer when one can be spared. Fewer, larger
+ * Read() calls mean fewer packet round-trips to the filesystem.
+ *
+ * It also sidesteps a storage bug seen on Emu68/PiStorm (FFS on SD): reading a
+ * file in 8 KB chunks returned WRONG data — six reads of one file gave three
+ * different results and never the right one — while 32 KB+ reads were correct
+ * every time. An Amiga-side `copy` of the same bytes corrupted identically, so
+ * the fault is under DOS, not here. This does not fix that machine; it only
+ * keeps us off the path that breaks on it. */
+#define PUMPBUF 65536
+
 static int pump(int sock, BPTR fh, ULONG len)
 {
+    APTR big  = AllocMem(PUMPBUF, MEMF_ANY);
+    UBYTE *buf = big ? (UBYTE *)big : g_io;   /* 2 MB machines keep the old path */
+    ULONG cap  = big ? PUMPBUF : IOBUF;
+    int ok = 1;
+
     while (len) {
-        LONG n = Read(fh, g_io, (LONG)(len > IOBUF ? IOBUF : len));
-        if (n <= 0) return 0;
-        if (!send_all(sock, g_io, (ULONG)n)) return 0;
+        LONG n = Read(fh, buf, (LONG)(len > cap ? cap : len));
+        if (n <= 0) { ok = 0; break; }
+        if (!send_all(sock, buf, (ULONG)n)) { ok = 0; break; }
         len -= (ULONG)n;
     }
-    return 1;
+    if (big) FreeMem(big, PUMPBUF);
+    return ok;
 }
 
 static const char ERRMARK[] = "\n--- stderr ---\n";
