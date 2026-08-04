@@ -569,3 +569,51 @@ class TestRegionCaptureAndProbes(Base):
         p = self.ami.pointer()
         self.assertEqual((p["x"], p["y"]), (100, 50))
         self.assertEqual((p["screen_width"], p["screen_height"]), (640, 256))
+
+
+class TestDragAndHold(Base):
+    """Holding a button down — Intuition menus need it, and a click cannot."""
+
+    def setUp(self):
+        fake_agent.INPUT_LOG.clear()
+
+    def test_drag_is_one_atomic_script(self):
+        amimcp.tool_drag(self.ami, {"from_x": 10, "from_y": 20,
+                                    "to_x": 100, "to_y": 60})
+        kinds = [e[0] for e in fake_agent.INPUT_LOG]
+        self.assertEqual(kinds[0], "script")          # one request, not three
+        self.assertEqual(fake_agent.INPUT_LOG[1], ("move", 10, 20))
+        # button goes down BEFORE the second move and up after it
+        down = kinds.index("button")
+        move2 = [i for i, e in enumerate(fake_agent.INPUT_LOG)
+                 if e == ("move", 100, 60)][0]
+        up = len(kinds) - 1 - kinds[::-1].index("button")
+        self.assertLess(down, move2)
+        self.assertLess(move2, up)
+
+    def test_drag_right_button_for_menus(self):
+        amimcp.tool_drag(self.ami, {"from_x": 5, "from_y": 5, "to_x": 5, "to_y": 40,
+                                    "button": "right"})
+        presses = [e for e in fake_agent.INPUT_LOG if e[0] == "button"]
+        self.assertEqual([p[1] for p in presses], [1, 1])   # 1 == right
+        self.assertEqual([p[2] for p in presses], [1, 0])   # down then up
+
+    def test_drag_relative_homes_before_each_move(self):
+        amimcp.tool_drag(self.ami, {"from_x": 30, "from_y": 40, "to_x": 80,
+                                    "to_y": 90, "relative": True})
+        kinds = [e[0] for e in fake_agent.INPUT_LOG]
+        self.assertEqual(kinds.count("home"), 2)
+        self.assertEqual(kinds.count("rmove"), 2)
+
+    def test_button_hold_and_release(self):
+        amimcp.tool_button(self.ami, {"down": True, "button": "right"})
+        self.assertEqual(fake_agent.INPUT_LOG, [("button", 1, 1)])
+        fake_agent.INPUT_LOG.clear()
+        out = amimcp.tool_button(self.ami, {"down": False, "button": "right"})
+        self.assertEqual(fake_agent.INPUT_LOG, [("button", 1, 0)])
+        self.assertIn("released", out[0]["text"])
+
+    def test_holding_warns_about_releasing(self):
+        out = amimcp.tool_button(self.ami, {"down": True})
+        self.assertIn("HELD DOWN", out[0]["text"])
+        self.assertIn("amiga_button down=false", out[0]["text"])

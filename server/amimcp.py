@@ -288,6 +288,65 @@ TOOLS = [
         },
     },
     {
+        "name": "amiga_drag",
+        "description": (
+            "Press the mouse button at one point, move to another, and release — "
+            "all in one atomic sequence with real timing. Use this for drag-and-drop, "
+            "dragging a window or scrollbar, rubber-band selection, and anything that "
+            "needs the button held down while the pointer moves. "
+            "IMPORTANT for Amiga menus: Intuition menus are opened by HOLDING the "
+            "RIGHT button at the top of the screen, moving to the item, and releasing. "
+            "Drag with button 'right' from the menu bar to the item — a normal click "
+            "cannot reach a menu at all."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "from_x": {"type": "number", "description": "Where to press."},
+                "from_y": {"type": "number"},
+                "to_x": {"type": "number", "description": "Where to release."},
+                "to_y": {"type": "number"},
+                "button": {"type": "string", "enum": ["left", "right", "middle"],
+                           "description": "Default 'left'. Use 'right' for Intuition menus."},
+                "relative": {
+                    "type": "boolean",
+                    "description": (
+                        "Position by homing the pointer and moving by a delta instead of "
+                        "warping. Needed for SDL programs and games, which keep their own "
+                        "cursor and never see a warp."
+                    ),
+                },
+                "settle": {
+                    "type": "number",
+                    "description": "Ticks (1/50 s) to pause at each step. Default 5. Raise it if the program is slow to react.",
+                },
+            },
+            "required": ["from_x", "from_y", "to_x", "to_y"],
+        },
+    },
+    {
+        "name": "amiga_button",
+        "description": (
+            "Press or release a mouse button on its own, without moving the pointer. "
+            "Use this when you need the button held across several steps — press it, "
+            "take a screenshot to see what appeared (a menu, a drag preview), then move "
+            "and release. For a simple hold-move-release in one go, prefer amiga_drag. "
+            "ALWAYS release afterwards: a button left down leaves the Amiga behaving as "
+            "though a finger is resting on it, which blocks other input and is easy to "
+            "mistake for the machine having hung."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "button": {"type": "string", "enum": ["left", "right", "middle"],
+                           "description": "Default 'left'."},
+                "down": {"type": "boolean",
+                         "description": "true to press and hold, false to release."},
+            },
+            "required": ["down"],
+        },
+    },
+    {
         "name": "amiga_type",
         "description": (
             "Type text on the Amiga as if at the keyboard. Characters are mapped "
@@ -558,6 +617,43 @@ def tool_move_mouse(ami: Amiga, args: dict) -> list[dict]:
     return [{"type": "text", "text": f"Pointer moved to ({x}, {y})."}]
 
 
+def tool_drag(ami: Amiga, args: dict) -> list[dict]:
+    """Press, move, release — as one request, so the gaps are Amiga ticks.
+
+    Splitting this across calls does not work: each request opens its own
+    connection, so press and release land hundreds of milliseconds apart and the
+    program sees a held button rather than a drag.
+    """
+    fx, fy = int(args["from_x"]), int(args["from_y"])
+    tx, ty = int(args["to_x"]), int(args["to_y"])
+    button = args.get("button", "left")
+    settle = int(args.get("settle", 5))
+    rel = bool(args.get("relative", False))
+
+    start = [("home",), ("rmove", fx, fy)] if rel else [("move", fx, fy)]
+    end = [("home",), ("rmove", tx, ty)] if rel else [("move", tx, ty)]
+    ami.input_script(
+        start + [("wait", settle), ("button", button, True), ("wait", settle)]
+        + end + [("wait", settle), ("button", button, False)]
+    )
+    how = " (relative positioning)" if rel else ""
+    return [{"type": "text",
+             "text": f"Dragged {button} from ({fx}, {fy}) to ({tx}, {ty}){how}."}]
+
+
+def tool_button(ami: Amiga, args: dict) -> list[dict]:
+    button = args.get("button", "left")
+    down = bool(args["down"])
+    ami.input_button(button, down)
+    if down:
+        return [{"type": "text", "text": (
+            f"{button} button is now HELD DOWN. Release it with "
+            f"amiga_button down=false — until you do, the Amiga behaves as though "
+            f"a finger is resting on it and other input may not get through."
+        )}]
+    return [{"type": "text", "text": f"{button} button released."}]
+
+
 def tool_screens(ami: Amiga, args: dict) -> list[dict]:
     rows = ami.screens()
     if not rows:
@@ -608,6 +704,8 @@ HANDLERS = {
     "amiga_shell": tool_shell,
     "amiga_break": tool_break,
     "amiga_click": tool_click,
+    "amiga_drag": tool_drag,
+    "amiga_button": tool_button,
     "amiga_move_mouse": tool_move_mouse,
     "amiga_type": tool_type,
     "amiga_key": tool_key,
