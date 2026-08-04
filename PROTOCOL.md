@@ -48,9 +48,12 @@ exception: it precedes the real request on the same connection.
 | 0x04 | `PUT`  | `pathlen` (u16) + path + file bytes  | *(empty)* |
 | 0x05 | `LIST` | Path, text                           | TSV directory listing |
 | 0x06 | `INFO` | *(empty)*                            | `key=value` lines |
-| 0x07 | `SHOT` | *(empty)*                            | Screen capture (see below) |
+| 0x07 | `SHOT` | *(empty)*, or a region — see below   | Screen capture (see below) |
 | 0x08 | `INPUT`| Op byte + op fields (see below)      | *(empty)* |
 | 0x09 | `BREAK`| *(empty)*                            | What was signalled, text |
+| 0x0A | `SCREENS` | *(empty)*                         | Open screens, front to back |
+| 0x0B | `POINTER` | *(empty)*                         | `x`, `y`, `screen_w`, `screen_h` (u16 each) |
+| 0x0C | `HASH` | Same as `SHOT`                       | `checksum` (u32) |
 | 0x10 | `AUTH` | Shared token, text                   | *(empty)* |
 
 Text payloads are **not** NUL-terminated; the frame length delimits them.
@@ -141,6 +144,47 @@ bit string (`hsparwed`). `date` is `DD-MMM-YY HH:MM:SS`. Names may contain
 spaces — that is why `name` is last and why the separator is a tab, which
 AmigaDOS filenames cannot contain.
 
+## `SHOT` / `HASH` request
+
+The payload is optional. Omitting it means "the whole frontmost screen", exactly
+as before:
+
+```
+(empty)                     whole front screen
+u16 x, y, w, h              that rectangle; w or h of 0 means "out to the edge"
+u16 x, y, w, h, u8 screen   ... on screen `screen` (0 = frontmost)
+```
+
+A region is worth having because most captures are made to read one small thing.
+Pulling a 1920×1080 truecolour frame across a ~1 MB/s link to read a 320×14
+status line moves about a thousand times more data than the question needs — 7.4
+seconds against effectively none, measured on an A4000/060. `HASH` takes the
+same payload and returns only a `u32` checksum, so *"has this area changed
+yet?"* costs no pixels at all.
+
+Capturing by screen index matters when a crashed program leaves a blank screen
+in front: the machine is fine underneath, and without it the agent is blind.
+
+## `SCREENS` response
+
+```
+u8 count, then per screen:
+  u8 index, u16 width, u16 height, u8 depth, u32 modeid, u8 titlelen, title
+```
+
+Index 0 is the frontmost. Lets a client derive its coordinate mapping from real
+geometry instead of discovering it by trial.
+
+## `POINTER` response
+
+```
+u16 x, u16 y, u16 screen_w, u16 screen_h
+```
+
+Where Intuition's pointer is — cheap enough to ask before every click. Note that
+a program tracking raw mouse deltas keeps a cursor of its own that nothing else
+can see; see *Absolute versus relative pointer motion* below.
+
 ## `SHOT` response
 
 ```
@@ -187,6 +231,18 @@ One op byte, then that op's fields:
 | 5  | `CLICK`  | `x` (u16), `y` (u16), `button` (u8), `count` (u8) |
 | 6  | `RMOVE`  | `dx` (**s16**), `dy` (**s16**)      |
 | 7  | `HOME`   | *(no fields)*                       |
+| 8  | `SCRIPT` | `count` (u8), then that many sub-events |
+
+`SCRIPT` sub-events use the op numbers above plus `9 WAIT` (`ticks`, u16, 1/50 s
+each): `MOVE`, `BUTTON`, `KEY`, `RMOVE`, `HOME`, `WAIT`.
+
+The whole list runs inside one request, so the gaps between events are the
+Amiga's own ticks rather than however long a TCP round trip happened to take.
+That distinction is the entire point: a press and a release sent as two requests
+arrive hundreds of milliseconds apart, which programs read as a **held button**,
+not a click. Drags, double-clicks and Intuition menus — which are opened by
+holding the right button, moving, and releasing — all need the timing to be
+real.
 
 `button` is 0 left, 1 right, 2 middle.
 

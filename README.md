@@ -35,8 +35,13 @@ Two halves:
 | `amiga_write_file` | Write or overwrite a file, binaries included |
 | `amiga_list_dir` | List a drawer with sizes, protection bits, datestamps |
 | `amiga_system_info` | Kickstart, CPU/FPU, free Chip/Fast, volumes, assigns |
-| `amiga_screenshot` | Capture the frontmost screen as PNG — planar or RTG |
+| `amiga_screenshot` | Capture a screen as PNG — planar or RTG, whole or a region |
+| `amiga_screens` | List every open screen, front to back, with geometry |
+| `amiga_pointer` | Where the pointer is — no image transferred |
+| `amiga_region_changed` | Checksum a region: "has anything changed yet?" |
 | `amiga_click` | Move the pointer and click — single, double, any button |
+| `amiga_drag` | Press, move, release — drag-and-drop, scrollbars, **menus** |
+| `amiga_button` | Hold or release a button on its own |
 | `amiga_move_mouse` | Move the pointer without clicking |
 | `amiga_type` | Type text, mapped through the Amiga's own keymap |
 | `amiga_key` | Press Return, Esc, F-keys and so on, with qualifiers |
@@ -46,6 +51,19 @@ Together those are enough to actually work: read a Startup-Sequence and fix it,
 cross-compile a binary and push it over and run it, launch a GUI program and
 drive it by clicking, or just look at what the machine is showing when it has
 gone wrong.
+
+Two things are worth knowing before you drive a GUI:
+
+- **Watch cheaply.** A full 1080p truecolour frame is ~6 MB over a ~1 MB/s link —
+  about 7 seconds. Reading one status line as a *region* is effectively free, and
+  `amiga_region_changed` answers "has it finished drawing?" in four bytes. Poll
+  with hashes; capture pixels only when you need to look.
+- **Two kinds of pointer.** `amiga_click` warps the Intuition pointer, which
+  Intuition applications follow. SDL programs — games, ScummVM — track raw mouse
+  *deltas* and keep their own cursor, so they never see the warp and the click
+  lands wherever they still believe the pointer is. Pass `relative: true` for
+  those. And an Amiga menu is opened by *holding* the right button and moving,
+  so it needs `amiga_drag`, not a click.
 
 ## 1. Install the agent on the Amiga
 
