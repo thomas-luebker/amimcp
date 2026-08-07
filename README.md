@@ -311,8 +311,9 @@ as the machine. Each phase self-calibrates to a ≥2 s window, because a fixed
 workload is useless across a 70× speed range — a PiStorm finished an entire
 50 MB memcpy inside a *single* 1/50 s tick.
 
-An A1200 + PiStorm32-lite measured ~72× an A4000/060 at 50 MHz on CPU and Fast
-RAM, which cross-checks against SysInfo putting the same pair 50.1× apart. Chip
+An A1200 + PiStorm32-lite measured ~73× an A4000/060 at 50 MHz on CPU and Fast
+RAM, reproducible to within 3% across two runs, and cross-checking against
+SysInfo putting the same pair 50.1× apart. Chip
 RAM does not follow — see [its README](tools/amibench/README.md) for why that
 matters more than the headline number.
 

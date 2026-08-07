@@ -37,13 +37,20 @@ Fast and measure the chipset bus instead of the CPU.
 
 | Phase | A1200 + PiStorm32-lite (Emu68, Pi 4 @1.8 GHz) | A4000/060 @50 MHz | Ratio |
 |---|---:|---:|---:|
-| ALU | 151.7 M iter/s | 2.8 M iter/s | 54x |
-| memcpy | 1.19 GB/s | 17.6 MB/s | 67x |
-| memset | 1.09 GB/s | 16.5 MB/s | 66x |
-| read | 3.98 GB/s | 35.5 MB/s | 112x |
+| ALU | 152.8 M iter/s | 2.8 M iter/s | 54x |
+| memcpy | 1.22 GB/s | 17.6 MB/s | 69x |
+| memset | 1.12 GB/s | 16.5 MB/s | 68x |
+| read | 4.10 GB/s | 35.5 MB/s | 116x |
 
-Geometric mean ~72x. Cross-checks against SysInfo 4.4, which independently puts
+Geometric mean ~73x. Cross-checks against SysInfo 4.4, which independently puts
 the same two machines 50.1x apart on both Dhrystones and MIPS.
+
+**Reproducibility.** The PiStorm figures above are a re-run on 2026-08-07. An
+earlier run on 2026-08-05 — different SD card, same machine and same
+`config.txt` — gave 151.7 M iter/s, 1.19 GB/s, 1.09 GB/s and 3.98 GB/s, i.e.
+**within 0.7–3.1%**. That spread is what the ×4 rep scaling and a 1/50 s timer
+cost you, and it is the right order of magnitude to treat as noise: differences
+smaller than about 5% between two runs are not differences.
 
 Note that Chip RAM does **not** follow: the PiStorm reaches the real A1200
 chipset across its bus and measures 1.54x an A600, against the A4000's 2.25x.
