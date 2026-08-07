@@ -168,9 +168,20 @@ args = ["/path/to/amimcp/server/amimcp.py"]
 env = { AMIGA_HOST = "192.168.1.42", AMIGA_TOKEN = "pickasecret" }
 ```
 
-**Cursor, Zed, Cline, Windsurf, Goose** and most others take the same
-`mcpServers` JSON block shown above for Claude Desktop, in their own settings
-file. Check your client's current docs for the exact path — these move.
+**Google Gemini CLI**, **Cursor**, **Zed**, **Cline**, **Continue**,
+**Windsurf**, **LM Studio** and **Goose** take the same `mcpServers` JSON block
+shown above for Claude Desktop, in their own settings file. Check your client's
+current docs for the exact path — these move.
+
+So by model:
+
+| Model | Reach it through |
+|---|---|
+| **Claude** (Anthropic) | Claude Code, Claude Desktop — *tested* |
+| **GPT / ChatGPT** (OpenAI) | Codex CLI |
+| **Gemini** (Google) | Gemini CLI |
+| **Local / open weights** | LM Studio, Goose, Cline, Continue |
+| **Whatever your editor uses** | Cursor, Zed, Windsurf |
 
 > Tested against Claude Code and Claude Desktop. The rest follow from it being a
 > standard stdio server rather than from me having run all of them; if one needs
