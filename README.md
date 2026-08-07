@@ -81,8 +81,11 @@ amipkg install amiagent
 
 ### Or build it yourself
 
-Needs [bebbo's amiga-gcc](https://github.com/bebbo/amiga-gcc). Cross-compile on
-any machine that has it:
+Needs an m68k-amigaos cross-toolchain —
+[AmigaPorts/m68k-amigaos-gcc](https://github.com/AmigaPorts/m68k-amigaos-gcc),
+the maintained descendant of bebbo's amiga-gcc. (Bebbo's own repository is gone
+as of 2026-08-07; AmigaPorts is where it lives now.) Cross-compile on any
+machine that has it:
 
 ```sh
 cd agent && make                # 68000 baseline, runs on every Amiga
@@ -286,7 +289,7 @@ AmigaDOS-shaped commands rather than actually running AmigaDOS.
 PROTOCOL.md          the wire format, and why it looks like that
 agent/amiagent.c     the Amiga daemon
 agent/proto.h        constants shared with the Python side
-agent/Makefile       bebbo amiga-gcc build
+agent/Makefile       m68k-amigaos-gcc build
 agent/vendor/cgx/    CyberGraphX interface files (see its README)
 server/amimcp.py     MCP server (stdio JSON-RPC)
 server/amiga.py      wire protocol client

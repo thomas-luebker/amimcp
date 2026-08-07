@@ -1,4 +1,5 @@
-# amiagent — AmigaOS build (bebbo amiga-gcc, https://github.com/bebbo/amiga-gcc)
+# amiagent — AmigaOS build (m68k-amigaos-gcc; see
+# https://github.com/AmigaPorts/m68k-amigaos-gcc — bebbo's original repo is gone)
 #
 #   make                   → amiagent (68000 baseline; runs on every Amiga)
 #   make CPU=68020         → 68020+ build
