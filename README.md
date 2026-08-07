@@ -115,7 +115,7 @@ comes up:
 run >NIL: amiagent TOKEN=pickasecret QUIET
 ```
 
-## 3. Point Claude at it
+## 3. Point your assistant at it
 
 ```sh
 ./install.sh 192.168.1.42 pickasecret
@@ -150,14 +150,42 @@ For **Claude Desktop**, add this to `claude_desktop_config.json`:
 
 Start a new session and ask Claude to check the Amiga.
 
-### Check the link without involving Claude
+### Other MCP clients — Codex, Cursor, Zed, Cline…
+
+MCP is an open standard, and `server/amimcp.py` is an ordinary **stdio MCP
+server**: it speaks JSON-RPC over stdin/stdout and takes its configuration from
+environment variables. Anything that can launch an MCP server can therefore
+drive the Amiga — the server does not know or care which model is on the other
+end.
+
+Only the config file shape differs. **OpenAI Codex CLI** (`~/.codex/config.toml`)
+uses TOML:
+
+```toml
+[mcp_servers.amiga]
+command = "python3"
+args = ["/path/to/amimcp/server/amimcp.py"]
+env = { AMIGA_HOST = "192.168.1.42", AMIGA_TOKEN = "pickasecret" }
+```
+
+**Cursor, Zed, Cline, Windsurf, Goose** and most others take the same
+`mcpServers` JSON block shown above for Claude Desktop, in their own settings
+file. Check your client's current docs for the exact path — these move.
+
+> Tested against Claude Code and Claude Desktop. The rest follow from it being a
+> standard stdio server rather than from me having run all of them; if one needs
+> something different, please open an issue and say what.
+
+Requires Python 3 — standard library only, no `pip install`, no venv.
+
+### Check the link without involving an LLM
 
 ```sh
 AMIGA_HOST=192.168.1.42 AMIGA_TOKEN=pickasecret python3 server/amimcp.py --probe
 ```
 
 This skips MCP entirely, so a failure here is a network or agent problem rather
-than a Claude one.
+than a client one.
 
 ## Environment
 
