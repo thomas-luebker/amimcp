@@ -254,8 +254,28 @@ server/amiga.py      wire protocol client
 server/png.py        chunky/RGB → PNG, stdlib zlib
 tests/fake_agent.py  host-side stand-in for the Amiga
 tests/               end-to-end and protocol-drift tests
+tools/amibench/      CPU/memory benchmark for comparing Amigas
+tools/lhapack/       builds the release archive (macOS has no LHA writer)
 install.sh           register with Claude Code
 ```
+
+## Also here: amibench
+
+[`tools/amibench`](tools/amibench) is a small CPU/memory benchmark for answering
+"how much faster is machine A than machine B". It is standalone — it needs
+nothing else installed — and there is a ready-made binary on the
+[releases page](https://github.com/thomas-luebker/amimcp/releases/latest).
+
+It is built for 68020 so **one identical binary** runs on an 020, an 040, an 060
+and on Emu68's JIT; comparing separate builds would measure the compiler as much
+as the machine. Each phase self-calibrates to a ≥2 s window, because a fixed
+workload is useless across a 70× speed range — a PiStorm finished an entire
+50 MB memcpy inside a *single* 1/50 s tick.
+
+An A1200 + PiStorm32-lite measured ~72× an A4000/060 at 50 MHz on CPU and Fast
+RAM, which cross-checks against SysInfo putting the same pair 50.1× apart. Chip
+RAM does not follow — see [its README](tools/amibench/README.md) for why that
+matters more than the headline number.
 
 ## Licence
 
