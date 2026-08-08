@@ -12,7 +12,12 @@ m68k-amigaos-gcc -O2 -m68020 -noixemul -Wall -o amibench amibench.c
 ```
 
 Phases: integer ALU (dependency-chained, so it cannot be pipelined away),
-`memcpy`, `memset`, and a linear read.
+**FPU**, `memcpy`, `memset`, a linear read, and **Chip RAM** copy and read.
+
+> Built with `-m68881`, so it needs an FPU. Without that flag the compiler
+> emits soft-float and the FPU phase would time an emulation library instead of
+> the coprocessor. The phase is still gated on `AttnFlags` at runtime, because
+> executing an FPU instruction on a machine without one traps.
 
 ## Three things it does deliberately
 
@@ -30,27 +35,56 @@ ticks; the host divides. Rate maths would drag in soft-float or an FPU
 dependency and change what is being measured, and byte totals overflow 32 bits
 at these speeds.
 
-Allocations are `MEMF_FAST` — `MEMF_ANY` can land in Chip on a machine short of
-Fast and measure the chipset bus instead of the CPU.
+The Fast phases allocate `MEMF_FAST` explicitly — `MEMF_ANY` can land in Chip on
+a machine short of Fast and measure the chipset bus instead of the CPU. The Chip
+phases measure that bus deliberately, with 512 KB buffers, because there is only
+2 MB of Chip and the OS is already in it.
 
 ## Results so far
 
-| Phase | A1200 + PiStorm32-lite (Emu68, Pi 4 @1.8 GHz) | A4000/060 @50 MHz | Ratio |
+An A1200 + PiStorm32-lite (Emu68, Pi 4 @1.8 GHz) against an A4000/060 at
+**100 MHz** (`cpuspeed SPEED 100`), 2026-08-08:
+
+| Phase | A4000 @100 MHz | PiStorm | Ratio |
 |---|---:|---:|---:|
-| ALU | 152.8 M iter/s | 2.8 M iter/s | 54x |
-| memcpy | 1.22 GB/s | 17.6 MB/s | 69x |
-| memset | 1.12 GB/s | 16.5 MB/s | 68x |
-| read | 4.10 GB/s | 35.5 MB/s | 116x |
+| ALU | 5.8 M iter/s | 151.7 M iter/s | 26.0x |
+| FPU | 2.9 M iter/s | 57.0 M iter/s | **19.6x** |
+| memcpy | 34.5 MB/s | 1.18 GB/s | 34.1x |
+| memset | 30.5 MB/s | 1.10 GB/s | 36.1x |
+| read | 69.9 MB/s | 4.01 GB/s | 57.3x |
+| **Chip memcpy** | **2.4 MB/s** | **2.1 MB/s** | **0.87x** |
+| **Chip read** | **4.4 MB/s** | **2.7 MB/s** | **0.62x** |
 
-Geometric mean ~73x. Cross-checks against SysInfo 4.4, which independently puts
-the same two machines 50.1x apart on both Dhrystones and MIPS.
+Two results the Fast-RAM-only version could not have found:
 
-**Reproducibility.** The PiStorm figures above are a re-run on 2026-08-07. An
-earlier run on 2026-08-05 — different SD card, same machine and same
-`config.txt` — gave 151.7 M iter/s, 1.19 GB/s, 1.09 GB/s and 3.98 GB/s, i.e.
-**within 0.7–3.1%**. That spread is what the ×4 rep scaling and a 1/50 s timer
-cost you, and it is the right order of magnitude to treat as noise: differences
-smaller than about 5% between two runs are not differences.
+**Chip RAM is where the PiStorm loses.** It is *slower than a real A4000* on
+both Chip phases. And the gulf between its own Fast and Chip RAM is enormous -
+**561x on copy, 1467x on read**, against 14x and 16x on the A4000. Anything
+touching Chip RAM (native screens, audio buffers, floppy work, most unpatched
+games and demos) falls off a cliff that simply does not exist on real hardware.
+This is measured here rather than quoted from SysInfo, which was the point.
 
-Note that Chip RAM does **not** follow: the PiStorm reaches the real A1200
-chipset across its bus and measures 1.54x an A600, against the A4000's 2.25x.
+**The FPU advantage is smaller than the integer one** - 19.6x against 26.0x -
+so Emu68 translates integer work more efficiently than floating point. Worth
+noting SysInfo disagrees sharply: its MFLOPS put the same two machines **42x**
+apart, more than double what this measures. Two tools, one machine pair, results
+that differ by 2x: at least one of them is measuring something other than what
+its label says. Unresolved.
+
+## Reading the output, and its noise floor
+
+Every phase is stable to **under 1%** run to run - except `memset`, which
+spreads about **9%**. Treat differences under ~10% as noise unless you have
+repeated them.
+
+Compare **rates (reps / time), never raw ticks**. A phase that lands just under
+the tick floor quadruples its reps and runs 4x longer for an identical rate: one
+`memset` run reported 640 reps / 122 ticks and another 2560 reps / 490 ticks -
+the same 1.10 GB/s, and an alarming-looking number if you read only the ticks.
+
+> **Do not tidy the scan loops into a shared helper.** Factoring the read loop
+> out into one cost the inlining and made the word count a runtime argument,
+> which measured **13% slower on Emu68** - stable to 0.7% across runs, so a real
+> change in what was measured, not noise. The duplication between `run_read` and
+> `run_chipread` is deliberate. A benchmark whose numbers move when you clean up
+> its code is not measuring the machine.
