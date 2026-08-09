@@ -40,12 +40,29 @@ it works against any `amiagent` 0.1.1+ — the live screen needs 0.5.0+ for
 
 ## How it's built
 
-- `AmigaWire.swift` — the protocol, on blocking BSD sockets (one request per
-  connection, AUTH-then-command, big-endian framing) with async wrappers.
-- `Models.swift` — the `Fleet` store: polling, discovery, persistence.
-- `FleetView.swift` / `DetailView.swift` / `ScreenView.swift` — the three
-  window kinds. `ScreenView` drops to an AppKit `NSView` to catch raw mouse and
-  key events and translate macOS keycodes to Amiga rawkeys.
+- `AmigaKit/AmigaWire.swift` — the protocol as a standalone library, on
+  blocking BSD sockets (one request per connection, AUTH-then-command,
+  big-endian framing) with async wrappers. Shared by the GUI and the test CLI.
+- `amifleet/Models.swift` — the `Fleet` store: polling, discovery, persistence.
+- `amifleet/{FleetView,DetailView,ScreenView}.swift` — the three window kinds.
+  `ScreenView` drops to an AppKit `NSView` to catch raw mouse and key events
+  and translate macOS keycodes to Amiga rawkeys.
+
+## Testing the input path
+
+`amitest` is a headless harness that drives the **exact same `AmigaKit` code**
+the GUI's screen window calls, so the click/type/rawkey path can be verified
+against real hardware without automating the GUI:
+
+```
+swift run amitest <host> [token]              # full input self-test
+swift run amitest <host> [token] shot out.ppm # just grab a frame
+```
+
+The self-test opens a shell window on the Amiga, clicks to focus it, types an
+`Echo "<marker>"` and presses Return — so a screenshot of the machine shows the
+marker echoed back if every step worked. Verified on all three fleet machines
+(real A4000, PiStorm/Emu68, FS-UAE): the marker appears in each shell.
 
 This is a client, not a server: it holds no state on the Amiga and can't do
 anything a shell couldn't. Same trust model as the rest of amimcp — keep it on

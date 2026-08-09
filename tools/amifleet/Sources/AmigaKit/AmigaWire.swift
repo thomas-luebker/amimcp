@@ -8,12 +8,12 @@
 
 import Foundation
 
-enum AmigaWireError: LocalizedError {
+public enum AmigaWireError: LocalizedError {
     case unreachable(String)
     case refused(String)        // agent answered ST_ERR; message is its text
     case authRequired
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .unreachable(let why): return why
         case .refused(let msg): return msg
@@ -22,24 +22,24 @@ enum AmigaWireError: LocalizedError {
     }
 }
 
-struct AmigaScreenshot {
-    let width: Int
-    let height: Int
+public struct AmigaScreenshot {
+    public let width: Int
+    public let height: Int
     /// RGBA8888, width*height*4 — palette already applied.
-    let rgba: [UInt8]
+    public let rgba: [UInt8]
 }
 
-struct AmigaScreenInfo {
-    let index: Int
-    let width: Int
-    let height: Int
-    let depth: Int
-    let title: String
+public struct AmigaScreenInfo {
+    public let index: Int
+    public let width: Int
+    public let height: Int
+    public let depth: Int
+    public let title: String
 }
 
 /// Amiga raw key codes for the keys that have no printable character
 /// (printable text goes through TEXT, which uses the Amiga's own keymap).
-let amigaRawkeys: [String: UInt8] = [
+public let amigaRawkeys: [String: UInt8] = [
     "backspace": 0x41, "tab": 0x42, "enter": 0x43, "return": 0x44,
     "esc": 0x45, "delete": 0x46, "help": 0x5F, "space": 0x40,
     "up": 0x4C, "down": 0x4D, "right": 0x4E, "left": 0x4F,
@@ -47,10 +47,14 @@ let amigaRawkeys: [String: UInt8] = [
     "f6": 0x55, "f7": 0x56, "f8": 0x57, "f9": 0x58, "f10": 0x59,
 ]
 
-struct AmigaClient: Sendable {
-    let host: String
-    let port: UInt16
-    let token: String
+public struct AmigaClient: Sendable {
+    public let host: String
+    public let port: UInt16
+    public let token: String
+
+    public init(host: String, port: UInt16 = 7846, token: String = "") {
+        self.host = host; self.port = port; self.token = token
+    }
 
     // ---- commands --------------------------------------------------------
 
@@ -67,7 +71,7 @@ struct AmigaClient: Sendable {
 
     // ---- one transaction -------------------------------------------------
 
-    func request(_ code: UInt8, _ payload: Data = Data(),
+    public func request(_ code: UInt8, _ payload: Data = Data(),
                  timeout: TimeInterval = 10) throws -> Data {
         let fd = try connect(timeout: timeout)
         defer { close(fd) }
@@ -191,12 +195,12 @@ extension AmigaClient {
         try await Task.detached(priority: .userInitiated) { try body() }.value
     }
 
-    func ping() async throws -> String {
+    public func ping() async throws -> String {
         let body = try await detached { try request(Self.cmdPing) }
         return String(decoding: body, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    func info() async throws -> [String: String] {
+    public func info() async throws -> [String: String] {
         let body = try await detached { try request(Self.cmdInfo) }
         var out: [String: String] = [:]
         for line in String(decoding: body, as: UTF8.self).split(separator: "\n") {
@@ -208,7 +212,7 @@ extension AmigaClient {
     }
 
     /// Returns (rc, output). Deadline is the agent-side limit in seconds.
-    func exec(_ command: String, deadline: UInt16 = 60) async throws -> (Int32, String) {
+    public func exec(_ command: String, deadline: UInt16 = 60) async throws -> (Int32, String) {
         var built = Data()
         var d = deadline.bigEndian
         withUnsafeBytes(of: &d) { built.append(contentsOf: $0) }
@@ -222,7 +226,7 @@ extension AmigaClient {
         return (rc, String(decoding: body.dropFirst(4), as: UTF8.self))
     }
 
-    func screens() async throws -> [AmigaScreenInfo] {
+    public func screens() async throws -> [AmigaScreenInfo] {
         let body = try await detached { try request(Self.cmdScreens) }
         var out: [AmigaScreenInfo] = []
         var i = body.startIndex
@@ -242,13 +246,13 @@ extension AmigaClient {
         return out
     }
 
-    func regionHash() async throws -> UInt32 {
+    public func regionHash() async throws -> UInt32 {
         let body = try await detached { try request(Self.cmdHash) }
         guard body.count >= 4 else { throw AmigaWireError.unreachable("short HASH reply") }
         return body.prefix(4).withUnsafeBytes { UInt32(bigEndian: $0.load(as: UInt32.self)) }
     }
 
-    func screenshot(timeout: TimeInterval = 60) async throws -> AmigaScreenshot {
+    public func screenshot(timeout: TimeInterval = 60) async throws -> AmigaScreenshot {
         let body = try await detached { try request(Self.cmdShot, Data(), timeout: timeout) }
         guard body.count >= 8 else { throw AmigaWireError.unreachable("short SHOT reply") }
         let fmt = body[0]
@@ -294,14 +298,14 @@ extension AmigaClient {
 
     // ---- input injection -------------------------------------------------
 
-    func click(x: Int, y: Int, button: UInt8 = 0, count: UInt8 = 1) async throws {
+    public func click(x: Int, y: Int, button: UInt8 = 0, count: UInt8 = 1) async throws {
         let p = Data([5,                                 // IN_CLICK
                       UInt8(x >> 8), UInt8(x & 0xFF), UInt8(y >> 8), UInt8(y & 0xFF),
                       button, count])
         _ = try await detached { try request(Self.cmdInput, p) }
     }
 
-    func type(_ text: String) async throws {
+    public func type(_ text: String) async throws {
         // Latin-1, mapped through the Amiga's own keymap on the far side.
         let bytes = text.unicodeScalars.compactMap { $0.value <= 0xFF ? UInt8($0.value) : nil }
         guard !bytes.isEmpty else { return }
@@ -309,7 +313,7 @@ extension AmigaClient {
         _ = try await detached { try request(Self.cmdInput, p) }
     }
 
-    func pressKey(rawcode: UInt8, qualifier: UInt16 = 0) async throws {
+    public func pressKey(rawcode: UInt8, qualifier: UInt16 = 0) async throws {
         // One connection per frame, press then release — a press without a
         // release reads as a finger resting on the key (README, 0.4.0 notes).
         for down: UInt8 in [1, 0] {

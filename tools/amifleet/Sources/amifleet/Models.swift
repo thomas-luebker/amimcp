@@ -2,6 +2,7 @@
 
 import Foundation
 import SwiftUI
+import AmigaKit
 
 struct Machine: Identifiable, Codable, Hashable {
     var id = UUID()

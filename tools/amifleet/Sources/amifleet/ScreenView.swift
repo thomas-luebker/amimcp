@@ -9,6 +9,7 @@
 
 import SwiftUI
 import CoreGraphics
+import AmigaKit
 
 @MainActor
 final class ScreenSession: ObservableObject {
