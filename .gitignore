@@ -7,3 +7,4 @@ agent/amiagent
 
 # Release archives
 dist/
+tools/lhapack/.build/
