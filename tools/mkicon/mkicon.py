@@ -1,22 +1,34 @@
 #!/usr/bin/env python3
-"""Build an AmigaOS drawer icon (.info) for amiagent, from scratch.
+"""Build AmigaOS .info icons for the amiagent archive.
 
-Format is the classic DiskObject: 78-byte DiskObject, 56-byte DrawerData
-(drawers only), then two Images (20-byte header + planar data each) for the
-normal and selected states.
+Three roles, three looks - the first version got this wrong by putting
+app-style artwork on the drawer and shipping nothing for the files inside, so
+the folder looked like an application and opening it showed an empty window:
 
-Sized 57x14 at depth 2 to match the drawer icons already in SYS:Programs, so
-it sits on the same grid rather than looking like a transplant.
+    drawer   a plain Workbench drawer. A folder should look like a folder.
+    tool     the amiagent application icon - a screen with signal bars.
+    project  a document, for README.txt and license, with a DefaultTool so
+             double-clicking actually opens them.
 
-Colours are the standard Workbench 3.x four:
-    0 = grey (background)   1 = black (outline)
-    2 = white (highlight)   3 = blue (fill)
+Binary layout (this order matters - DrawerData is FIRST, not last):
+
+    DiskObject   78 bytes
+    DrawerData   56 bytes    drawers only
+    Image1       20 + planar
+    Image2       20 + planar
+    DefaultTool  ULONG len + NUL-terminated string, when set
+
+Icons are 57x14 at depth 2, matching the drawer icons already in SYS:Programs
+so they sit on the same grid. Colours are the standard Workbench four:
+0 grey, 1 black, 2 white, 3 blue.
 """
 
 import struct
+import sys
 
 W, H, DEPTH = 57, 14, 2
 BG, BLACK, WHITE, BLUE = 0, 1, 2, 3
+NOPOS = -2147483648
 
 
 def blank():
@@ -24,47 +36,67 @@ def blank():
 
 
 def rect(g, x0, y0, x1, y1, c):
-    for y in range(y0, y1 + 1):
-        for x in range(x0, x1 + 1):
-            if 0 <= x < W and 0 <= y < H:
-                g[y][x] = c
+    for y in range(max(0, y0), min(H, y1 + 1)):
+        for x in range(max(0, x0), min(W, x1 + 1)):
+            g[y][x] = c
 
 
 def frame(g, x0, y0, x1, y1, c):
-    for x in range(x0, x1 + 1):
-        g[y0][x] = c; g[y1][x] = c
-    for y in range(y0, y1 + 1):
-        g[y][x0] = c; g[y][x1] = c
+    for x in range(max(0, x0), min(W, x1 + 1)):
+        if 0 <= y0 < H: g[y0][x] = c
+        if 0 <= y1 < H: g[y1][x] = c
+    for y in range(max(0, y0), min(H, y1 + 1)):
+        if 0 <= x0 < W: g[y][x0] = c
+        if 0 <= x1 < W: g[y][x1] = c
 
 
-def draw(selected: bool):
-    """A drawer with a signal meter beside it: storage you can reach remotely."""
+def art_drawer(sel):
+    """A plain drawer. Deliberately unremarkable - it is a folder."""
     g = blank()
-    body, edge = (BLUE, WHITE) if not selected else (WHITE, BLUE)
+    body, edge = (BLUE, WHITE) if not sel else (WHITE, BLUE)
+    rect(g, 6, 1, 14, 2, BLACK)                  # tab
+    rect(g, 7, 2, 13, 2, body)
+    frame(g, 5, 3, 51, 12, BLACK)                # body
+    rect(g, 6, 4, 50, 11, body)
+    for x in range(6, 51): g[4][x] = edge        # top highlight
+    for y in range(4, 12): g[6][y - y + 6] = g[y][6]
+    for y in range(4, 12): g[y][6] = edge        # left highlight
+    return g
 
-    # Drawer tab (the little lip on top-left)
-    rect(g, 3, 1, 9, 2, BLACK)
-    rect(g, 4, 2, 8, 2, body)
 
-    # Drawer body
-    frame(g, 2, 3, 26, 12, BLACK)
-    rect(g, 3, 4, 25, 11, body)
-    # highlight along the top and left inner edge - gives it depth at 14px
-    for x in range(3, 26):
-        g[4][x] = edge
-    for y in range(4, 12):
-        g[y][3] = edge
-
-    # Signal meter: three bars, rising. Reads as "reachable" at this size.
-    for i, (x, top) in enumerate(((32, 9), (38, 6), (44, 3))):
+def art_tool(sel):
+    """The application: a screen with signal bars - it is reached over the net."""
+    g = blank()
+    body, edge = (BLUE, WHITE) if not sel else (WHITE, BLUE)
+    frame(g, 2, 2, 30, 11, BLACK)                # screen
+    rect(g, 3, 3, 29, 10, body)
+    for x in range(4, 29): g[4][x] = edge        # scanline highlight
+    rect(g, 12, 12, 20, 12, BLACK)               # stand
+    for i, (x, top) in enumerate(((36, 9), (42, 6), (48, 3))):
         frame(g, x, top, x + 3, 12, BLACK)
         rect(g, x + 1, top + 1, x + 2, 11, body)
+    return g
 
+
+def art_project(sel):
+    """A document: page with a folded corner and lines of text."""
+    g = blank()
+    page, ink = (WHITE, BLUE) if not sel else (BLUE, WHITE)
+    frame(g, 16, 0, 40, 13, BLACK)
+    rect(g, 17, 1, 39, 12, page)
+    # text lines, ragged right like real text
+    for y, x1 in ((3, 36), (5, 33), (7, 37), (9, 30), (11, 34)):
+        rect(g, 19, y, x1, y, ink)
+    # folded top-right corner: blank the triangle, then outline the fold
+    for i in range(6):
+        for x in range(40 - i, 40):
+            g[i][x] = BG
+        if 0 <= i < H:
+            g[i][40 - i - 1] = BLACK
     return g
 
 
 def planar(g):
-    """Grid -> interleaved bitplanes, each row padded to whole 16-bit words."""
     words = (W + 15) // 16
     out = bytearray()
     for plane in range(DEPTH):
@@ -77,51 +109,45 @@ def planar(g):
     return bytes(out)
 
 
-def image(data_ptr):
-    # LeftEdge, TopEdge, Width, Height, Depth, ImageData, PlanePick, PlaneOnOff, NextImage
-    return struct.pack(">hhhhhIBBI", 0, 0, W, H, DEPTH, data_ptr, 0x03, 0x00, 0)
+def image_header():
+    return struct.pack(">hhhhhIBBI", 0, 0, W, H, DEPTH, 1, 0x03, 0x00, 0)
 
 
-def build(current_x=-1, current_y=-1):
-    normal, select = planar(draw(False)), planar(draw(True))
+def build(kind, default_tool=None, x=NOPOS, y=NOPOS):
+    art = {"drawer": art_drawer, "tool": art_tool, "project": art_project}[kind]
+    do_type = {"drawer": 2, "tool": 3, "project": 4}[kind]
 
-    gadget = struct.pack(
-        ">IhhhhHHH", 0, 0, 0, W, H,
-        0x0006,          # GADGIMAGE | GADGHIMAGE - two-image gadget
-        0x0001,          # RELVERIFY
-        0x0001,          # BOOLGADGET
-    )
-    gadget += struct.pack(">IIIIIHI", 1, 1, 0, 0, 0, 0, 0)   # render/select/text/... placeholders
+    gadget = struct.pack(">IhhhhHHH", 0, 0, 0, W, H, 0x0006, 0x0001, 0x0001)
+    gadget += struct.pack(">IIIIIHI", 1, 1, 0, 0, 0, 0, 0)
     gadget = gadget[:44]
 
-    NOPOS = -2147483648
     do = struct.pack(">HH", 0xE310, 1) + gadget
-    do += bytes([2, 0])                                   # do_Type = drawer, pad
-    do += struct.pack(">II", 0, 0)                        # DefaultTool, ToolTypes
-    do += struct.pack(">ii", current_x if current_x >= 0 else NOPOS,
-                            current_y if current_y >= 0 else NOPOS)
-    do += struct.pack(">III", 1, 0, 0)                    # DrawerData ptr, ToolWindow, StackSize
+    do += bytes([do_type, 0])
+    do += struct.pack(">II", 1 if default_tool else 0, 0)      # DefaultTool, ToolTypes
+    do += struct.pack(">ii", x, y)
+    do += struct.pack(">III", 1 if kind == "drawer" else 0, 0, 0)  # DrawerData, ToolWindow, Stack
     assert len(do) == 78, len(do)
 
-    # DrawerData: 48-byte NewWindow + dd_CurrentX/Y. The window the drawer opens
-    # to; modest and on-screen for any Workbench.
-    nw = struct.pack(">hhhhBBIIIIIIhhhhH",
-                     40, 40, 300, 120, 0xFF, 0xFF,
-                     0, 0, 0, 0, 0, 0,
-                     90, 40, 640, 200, 1)
-    dd = nw[:48] + struct.pack(">ii", 0, 0)
-    dd = (dd + b"\0" * 56)[:56]
-
-    return (do + dd
-            + image(1) + normal
-            + image(1) + select
-            + struct.pack(">IIH", 4, 1, 1))   # trailing block, as real icons carry
+    out = bytearray(do)
+    if kind == "drawer":
+        nw = struct.pack(">hhhhBBIIIIIIhhhhH", 60, 50, 320, 130, 0xFF, 0xFF,
+                         0, 0, 0, 0, 0, 0, 90, 40, 640, 200, 1)
+        out += (nw[:48] + struct.pack(">ii", 0, 0) + b"\0" * 56)[:56]
+    out += image_header() + planar(art(False))
+    out += image_header() + planar(art(True))
+    if default_tool:
+        s = default_tool.encode("latin-1") + b"\0"
+        out += struct.pack(">I", len(s)) + s
+    return bytes(out)
 
 
 if __name__ == "__main__":
-    import sys
-    x = int(sys.argv[2]) if len(sys.argv) > 2 else -1
-    y = int(sys.argv[3]) if len(sys.argv) > 3 else -1
-    data = build(x, y)
-    open(sys.argv[1], "wb").write(data)
-    print(f"wrote {sys.argv[1]}: {len(data)} bytes  ({W}x{H} depth {DEPTH}, pos {x},{y})")
+    if len(sys.argv) < 3:
+        print("usage: mkicon.py <out.info> <drawer|tool|project> [defaultTool]")
+        raise SystemExit(2)
+    path, kind = sys.argv[1], sys.argv[2]
+    tool = sys.argv[3] if len(sys.argv) > 3 else None
+    data = build(kind, tool)
+    open(path, "wb").write(data)
+    print(f"wrote {path}: {len(data)} bytes ({kind}"
+          + (f", DefaultTool={tool}" if tool else "") + ")")
