@@ -19,3 +19,6 @@ tools/lhapack/.build/
 
 # amifleet Swift build artifacts
 tools/amifleet/.build/
+
+# amifleet packaging output
+tools/amifleet/build/

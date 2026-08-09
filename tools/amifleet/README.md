@@ -32,6 +32,31 @@ shows the fetch time so slowness is visible, not mysterious.
 swift run          # from tools/amifleet
 ```
 
+## Build a signed release
+
+`package.sh` builds `amifleet.app` — a universal (arm64 + x86_64) binary with
+the icon, signed with a Developer ID and hardened runtime:
+
+```
+./package.sh                        # build + Developer ID sign + verify
+./package.sh --notarize <profile>   # ... then notarize, staple, and make a DMG
+```
+
+Notarization needs an Apple notary credential stored once as a keychain
+profile (either form works):
+
+```
+xcrun notarytool store-credentials amifleet-notary \
+    --apple-id you@example.com --team-id Y38P2BJ4DM --password <app-specific-pw>
+# or an App Store Connect API key:
+xcrun notarytool store-credentials amifleet-notary \
+    --key AuthKey_XXXX.p8 --key-id XXXX --issuer <issuer-uuid>
+```
+
+The icon is rendered from `icon/makeicon.swift` (CoreGraphics, no deps);
+`icon/icon-1024.png` is the committed master `package.sh` slices into the
+`.icns`.
+
 It starts with the three machines from the amimcp fleet (A4000, PiStorm,
 FS-UAE), all on token `a4000`; edit or add your own with **Add…**, and the
 list persists in `UserDefaults`. Everything is a plain TCP request/response, so
