@@ -359,6 +359,16 @@ SysInfo putting the same pair 50.1× apart. Chip
 RAM does not follow — see [its README](tools/amibench/README.md) for why that
 matters more than the headline number.
 
+## Also here: amifleet
+
+[`tools/amifleet`](tools/amifleet) is a native macOS app — an Apple-Remote-
+Desktop for your Amigas. It shows every machine on your network as a tile with
+its live status, lets you pull a report and run AmigaDOS commands, and opens a
+live view of a machine's screen you can click and type into. It speaks the
+amiagent protocol directly, so there is **nothing extra to install** — it is
+not the MCP server. See the [**User Guide**](tools/amifleet/docs/GUIDE.md) to
+get started, or the [tool README](tools/amifleet/README.md) to build it.
+
 ## Licence
 
 Apache 2.0 — see [LICENSE](LICENSE). Vendored CyberGraphX interface files keep

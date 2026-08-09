@@ -7,6 +7,10 @@ no LLM in the loop. Dressed like a Workbench 3.x window because of course it is.
 
 ![the fleet board](docs/board.png)
 
+> **New here?** The [**User Guide**](docs/GUIDE.md) covers install, connecting
+> your Amigas, the live screen, security and troubleshooting. This README is
+> the developer/build side.
+
 ## What it does
 
 - **Fleet board** — one beveled tile per machine, polled every 5 s: online
