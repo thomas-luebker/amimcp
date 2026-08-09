@@ -1,0 +1,17 @@
+Vendored MUI 3.8 developer-kit header subset
+============================================
+
+Source: Aminet dev/mui/mui38dev.lha (MagicUserInterface 3.8 developer files,
+(c) Stefan Stuntz — freely distributable developer material). Only the
+C headers are vendored (libraries/, proto/, clib/, inline/).
+
+inline/muimaster.h is NOT the original: the 1997 file's multi-line asm
+strings don't compile on modern GCC, so it was rewritten against
+FD/muimaster_lib.fd using the NDK's LP* macros (same mechanism as the
+toolchain's own inlines). Same LVOs, same behaviour.
+
+Vendored here from amipkg's vendor/mui (same subset, same rewritten inline).
+
+Used at COMPILE TIME only by agent/amimon-mui.c. muimaster.library is opened
+at runtime and remains optional — the GadTools amimon covers systems without
+MUI.

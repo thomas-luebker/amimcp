@@ -21,6 +21,25 @@ Binary layout (this order matters - DrawerData is FIRST, not last):
 Icons are 57x14 at depth 2, matching the drawer icons already in SYS:Programs
 so they sit on the same grid. Colours are the standard Workbench four:
 0 grey, 1 black, 2 white, 3 blue.
+
+After the classic icon a GlowIcon appendix follows: an IFF FORM ICON with a
+FACE chunk and two RLE-compressed IMAG chunks (normal + selected), the OS3.5
+ColorIcon format. icon.library v44+ (OS 3.5/3.9/3.2, PeterK's replacement)
+renders that instead of the planar images - same artwork, but with a real
+transparent background and a glow halo on the selected state, so the icon
+sits on a patterned Workbench like the system's own GlowIcons do. Old
+icon.library stops reading after the classic data and never sees it.
+
+    FORM <size> ICON
+      FACE  6 bytes   w-1, h-1, flags (bit0 frameless), aspect, maxpalbytes-1
+      IMAG  10 + data transp, ncols-1, flags (1 transp | 2 palette),
+                      imgfmt (1 RLE), palfmt (0 raw), depth,
+                      imgbytes-1, palbytes-1, image, palette
+      IMAG  ...       the selected image
+
+The RLE is ILBM ByteRun1 over a continuous BIT stream: 8-bit control codes
+(n<128: copy n+1 items, n>128: repeat next item 257-n times), items depth
+bits wide, no alignment until the final byte is zero-padded.
 """
 
 import struct
@@ -115,6 +134,113 @@ def art_project(sel):
     return g
 
 
+# ---- GlowIcon appendix ----------------------------------------------------
+
+# Indices into GLOW_PAL. 0 must stay the transparent colour.
+G_T, G_BLK, G_DARK, G_MID, G_LIGHT, G_WHITE, G_GLOW = range(7)
+
+GLOW_PAL = [
+    (0xff, 0x00, 0xff),   # 0: transparent, never drawn
+    (0x10, 0x10, 0x10),   # 1: outline
+    (0x28, 0x48, 0x88),   # 2: body, bottom shade
+    (0x3a, 0x6a, 0xb8),   # 3: body, middle
+    (0x6a, 0x9a, 0xe0),   # 4: body, top shade
+    (0xf0, 0xf4, 0xff),   # 5: highlight / page white
+    (0xff, 0xd8, 0x50),   # 6: selection halo
+]
+
+
+def glow_normal(g):
+    """The classic art in GlowIcon colours: grey becomes transparent, the flat
+    blue body a three-band vertical gradient. Same drawing, better dress."""
+    out = [[G_T] * W for _ in range(H)]
+    for y in range(H):
+        body = G_LIGHT if y < 5 else (G_MID if y < 10 else G_DARK)
+        for x in range(W):
+            c = g[y][x]
+            if c == BLACK:   out[y][x] = G_BLK
+            elif c == WHITE: out[y][x] = G_WHITE
+            elif c == BLUE:  out[y][x] = body
+    return out
+
+
+def glow_selected(gn):
+    """Selected state, the GlowIcons way: the same image with a halo - every
+    transparent pixel touching the artwork lights up."""
+    out = [row[:] for row in gn]
+    for y in range(H):
+        for x in range(W):
+            if gn[y][x] != G_T:
+                continue
+            near = any(gn[y + dy][x + dx] != G_T
+                       for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+                       if 0 <= y + dy < H and 0 <= x + dx < W)
+            if near:
+                out[y][x] = G_GLOW
+    return out
+
+
+def rle_pack(values, depth):
+    """ByteRun1 over a bit stream: 8-bit controls, depth-bit items."""
+    stream = []                       # (value, bit width)
+    i, n = 0, len(values)
+    while i < n:
+        run = 1
+        while i + run < n and values[i + run] == values[i] and run < 128:
+            run += 1
+        if run >= 2:
+            stream.append((257 - run, 8))
+            stream.append((values[i], depth))
+            i += run
+        else:
+            lits = []
+            while i < n and len(lits) < 128:
+                if i + 1 < n and values[i + 1] == values[i]:
+                    break
+                lits.append(values[i])
+                i += 1
+            stream.append((len(lits) - 1, 8))
+            stream += [(v, depth) for v in lits]
+    buf, acc, nbits = bytearray(), 0, 0
+    for v, w in stream:
+        acc = (acc << w) | (v & ((1 << w) - 1))
+        nbits += w
+        while nbits >= 8:
+            nbits -= 8
+            buf.append((acc >> nbits) & 0xFF)
+    if nbits:
+        buf.append((acc << (8 - nbits)) & 0xFF)
+    return bytes(buf)
+
+
+def imag_chunk(grid, pal):
+    depth = max(1, (len(pal) - 1).bit_length())
+    img = rle_pack([p for row in grid for p in row], depth)
+    palbytes = bytes(c for rgb in pal for c in rgb)
+    body = struct.pack(">BBBBBBHH",
+                       0,               # transparent colour index
+                       len(pal) - 1,    # palette entries - 1
+                       0x01 | 0x02,     # has transparency + has palette
+                       1, 0,            # image RLE, palette raw
+                       depth,
+                       len(img) - 1, len(palbytes) - 1)
+    body += img + palbytes
+    return b"IMAG" + struct.pack(">I", len(body)) + body + (b"\0" if len(body) & 1 else b"")
+
+
+def glow_form(art):
+    normal = glow_normal(art(False))
+    face = struct.pack(">BBBBH", W - 1, H - 1,
+                       1,               # frameless: transparency, no emboss box
+                       0x11,            # 1:1 pixel aspect
+                       len(GLOW_PAL) * 3 - 1)
+    body = (b"ICON"
+            + b"FACE" + struct.pack(">I", len(face)) + face
+            + imag_chunk(normal, GLOW_PAL)
+            + imag_chunk(glow_selected(normal), GLOW_PAL))
+    return b"FORM" + struct.pack(">I", len(body)) + body
+
+
 def planar(g):
     words = (W + 15) // 16
     out = bytearray()
@@ -157,7 +283,10 @@ def build(kind, default_tool=None, x=NOPOS, y=NOPOS):
     out += image_header() + planar(art(True))
     if default_tool:
         s = default_tool.encode("latin-1") + b"\0"
+        if len(s) & 1:
+            s += b"\0"   # keep the GlowIcon FORM below on an even offset
         out += struct.pack(">I", len(s)) + s
+    out += glow_form(art)
     return bytes(out)
 
 

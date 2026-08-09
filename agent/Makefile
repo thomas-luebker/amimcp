@@ -22,7 +22,7 @@ ifdef OWNBASES
 CFLAGS += -DAMIAGENT_OWN_LIBBASES
 endif
 
-all: amiagent amimon
+all: amiagent amimon amimon-mui
 
 amiagent: amiagent.c proto.h status.h
 	$(CC) $(CFLAGS) -o $@ amiagent.c $(LDFLAGS)
@@ -30,7 +30,13 @@ amiagent: amiagent.c proto.h status.h
 amimon: amimon.c proto.h status.h
 	$(CC) $(CFLAGS) -o $@ amimon.c $(LDFLAGS)
 
+# The MUI monitor needs the vendored MUI 3.8 headers (compile-time only;
+# muimaster.library is opened at runtime) and -lamiga for DoMethod.
+# muistubs.c MUST stay a separate translation unit - see its header comment.
+amimon-mui: amimon-mui.c muistubs.c proto.h status.h
+	$(CC) $(CFLAGS) -Ivendor/mui/include -o $@ amimon-mui.c muistubs.c -lamiga $(LDFLAGS)
+
 clean:
-	rm -f amiagent amimon
+	rm -f amiagent amimon amimon-mui
 
 .PHONY: all clean

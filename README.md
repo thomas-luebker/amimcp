@@ -69,9 +69,13 @@ Two things are worth knowing before you drive a GUI:
 
 ### Download the release
 
-Grab [`amiagent-0.5.3.lha`](https://github.com/thomas-luebker/amimcp/releases/latest)
+Grab [`amiagent-0.7.0.lha`](https://github.com/thomas-luebker/amimcp/releases/latest)
 and unpack it on the Amiga. It contains `amiagent` (68000, runs on everything)
-and `amiagent.020` (68020+).
+and `amiagent.020` (68020+), plus two status monitors you can run next to it:
+`amimon` (GadTools, runs on any OS 2.04+ machine) and `amimon-mui` (MUI 3.8+,
+for the people whose Amiga already looks like YAM). The icons are classic
+planar images with a GlowIcon appendix, so OS 3.5+/3.2 shows them in colour
+with real transparency.
 
 ### With [amipkg](https://github.com/thomas-luebker/amipkg)
 
@@ -288,9 +292,14 @@ AmigaDOS-shaped commands rather than actually running AmigaDOS.
 ```
 PROTOCOL.md          the wire format, and why it looks like that
 agent/amiagent.c     the Amiga daemon
+agent/amimon.c       GadTools status monitor (watches the agent's board)
+agent/amimon-mui.c   the same monitor as a MUI app (needs MUI 3.8+ to run)
+agent/muistubs.c     out-of-line MUI varargs stubs (see its header comment)
+agent/status.h       the local status board amimon/amimon-mui read
 agent/proto.h        constants shared with the Python side
 agent/Makefile       m68k-amigaos-gcc build
 agent/vendor/cgx/    CyberGraphX interface files (see its README)
+agent/vendor/mui/    MUI 3.8 developer headers (compile-time only)
 server/amimcp.py     MCP server (stdio JSON-RPC)
 server/amiga.py      wire protocol client
 server/png.py        chunky/RGB → PNG, stdlib zlib
@@ -298,6 +307,7 @@ tests/fake_agent.py  host-side stand-in for the Amiga
 tests/               end-to-end and protocol-drift tests
 tools/amibench/      CPU/memory benchmark for comparing Amigas
 tools/lhapack/       builds the release archive (macOS has no LHA writer)
+tools/mkicon/        writes the .info icons (classic planar + GlowIcon)
 install.sh           register with Claude Code
 ```
 
