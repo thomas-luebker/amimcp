@@ -122,6 +122,34 @@ comes up:
 run >NIL: amiagent TOKEN=pickasecret QUIET
 ```
 
+### Watch it work: amimon and amimon-mui
+
+The archive ships a status monitor you run **on the Amiga itself**, in two
+flavours showing exactly the same thing:
+
+- **`amimon`** — GadTools, zero dependencies, runs on any OS 2.04+ machine.
+- **`amimon-mui`** — the same monitor as a resizable MUI window that follows
+  your MUI settings. Needs MUI 3.8+ (`muimaster.library` v19); without MUI it
+  says so and points you at `amimon`.
+
+Double-click either in the drawer, or from a Shell:
+
+```
+run >NIL: amimon
+```
+
+It finds the agent over local IPC (a named public semaphore — no network, no
+configuration) and updates twice a second: agent version and port, state, the
+request in flight, the last command, requests answered/failed, the client's
+address, a self-reported "Driver" label, and uptime. Start it before or after
+the agent, in any order — the fields fill in when the agent appears and say
+"not found" when it is gone.
+
+Two lines are worth a glance: the **Agent** row warns `OPEN, no token` if the
+agent runs unprotected, and the **Driver** row is whatever the client claims
+to be (`Claude Code / ...`) — a label the Amiga cannot verify, which is why it
+sits below the client's real IP address.
+
 ## 3. Point your assistant at it
 
 ```sh
