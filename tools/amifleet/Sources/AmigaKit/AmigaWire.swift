@@ -195,8 +195,8 @@ extension AmigaClient {
         try await Task.detached(priority: .userInitiated) { try body() }.value
     }
 
-    public func ping() async throws -> String {
-        let body = try await detached { try request(Self.cmdPing) }
+    public func ping(timeout: TimeInterval = 10) async throws -> String {
+        let body = try await detached { try request(Self.cmdPing, timeout: timeout) }
         return String(decoding: body, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 

@@ -32,6 +32,27 @@ shows the fetch time so slowness is visible, not mysterious.
 swift run          # from tools/amifleet
 ```
 
+## Connecting to your fleet
+
+**There is nothing else to install — amifleet is not the MCP server.** It talks
+the amiagent wire protocol straight over TCP, so all you need is `amiagent`
+running on each Amiga (`amiagent TOKEN=yoursecret`, port 7846). The MCP server
+in this repo (`server/`) is a *separate* thing, only for letting an LLM drive a
+machine; a person using amifleet never touches it.
+
+A fresh launch starts empty. Two ways in:
+
+- **Scan my network** — sweeps this Mac's own subnet(s) for agents on port 7846
+  and adds every one it finds (including token-protected ones). You give it the
+  token your agents use so it can talk to them.
+- **Add a machine…** — type a host, port and token by hand (for a machine on
+  another subnet, or reached through a port-forward like a local FS-UAE).
+
+Machines persist in `UserDefaults`; right-click a tile to **Edit…** its token
+or **Remove** it. Everything is plain TCP request/response, so it works against
+any `amiagent` 0.1.1+ — the live screen needs 0.5.0+ for `HASH`, and RTG
+capture needs a `cybergraphics.library` screen.
+
 ## Build a signed release
 
 `package.sh` builds `amifleet.app` — a universal (arm64 + x86_64) binary with
