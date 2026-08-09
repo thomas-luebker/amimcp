@@ -2,8 +2,12 @@ __pycache__/
 *.pyc
 .DS_Store
 
-# Built Amiga binary — produced by `make` in agent/
+# Built Amiga binaries — produced by `make` in agent/
 agent/amiagent
+agent/amimon
+
+# amibench build artifact — produced by the compile line in tools/amibench/README.md
+tools/amibench/amibench
 
 # Release archives
 dist/

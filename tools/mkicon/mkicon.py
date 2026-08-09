@@ -78,6 +78,25 @@ def art_tool(sel):
     return g
 
 
+def art_monitor(sel):
+    """amimon: a monitor screen showing a live readout - rising bars inside it.
+    Distinct from the tool icon (signal bars beside a screen) so the watcher and
+    the agent do not look identical on the same grid."""
+    g = blank()
+    body, edge = (BLUE, WHITE) if not sel else (WHITE, BLUE)
+    frame(g, 1, 0, 41, 10, BLACK)                # bezel
+    rect(g, 2, 1, 40, 9, body)                   # screen face
+    for x in range(3, 40): g[1][x] = edge        # top scanline highlight
+    # a bar-graph readout climbing across the screen - it shows status
+    for x, top in ((6, 7), (13, 6), (20, 5), (27, 4), (34, 3)):
+        rect(g, x, top, x + 3, 8, edge)
+        frame(g, x, top, x + 3, 8, BLACK)
+    rect(g, 19, 11, 23, 11, BLACK)               # neck
+    frame(g, 12, 12, 30, 13, BLACK)              # base
+    rect(g, 13, 13, 29, 13, body)
+    return g
+
+
 def art_project(sel):
     """A document: page with a folded corner and lines of text."""
     g = blank()
@@ -114,8 +133,9 @@ def image_header():
 
 
 def build(kind, default_tool=None, x=NOPOS, y=NOPOS):
-    art = {"drawer": art_drawer, "tool": art_tool, "project": art_project}[kind]
-    do_type = {"drawer": 2, "tool": 3, "project": 4}[kind]
+    art = {"drawer": art_drawer, "tool": art_tool, "monitor": art_monitor,
+           "project": art_project}[kind]
+    do_type = {"drawer": 2, "tool": 3, "monitor": 3, "project": 4}[kind]
 
     gadget = struct.pack(">IhhhhHHH", 0, 0, 0, W, H, 0x0006, 0x0001, 0x0001)
     gadget += struct.pack(">IIIIIHI", 1, 1, 0, 0, 0, 0, 0)
@@ -143,7 +163,7 @@ def build(kind, default_tool=None, x=NOPOS, y=NOPOS):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("usage: mkicon.py <out.info> <drawer|tool|project> [defaultTool]")
+        print("usage: mkicon.py <out.info> <drawer|tool|monitor|project> [defaultTool]")
         raise SystemExit(2)
     path, kind = sys.argv[1], sys.argv[2]
     tool = sys.argv[3] if len(sys.argv) > 3 else None

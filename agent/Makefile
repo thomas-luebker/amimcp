@@ -1,7 +1,7 @@
 # amiagent — AmigaOS build (m68k-amigaos-gcc; see
 # https://github.com/AmigaPorts/m68k-amigaos-gcc — bebbo's original repo is gone)
 #
-#   make                   → amiagent (68000 baseline; runs on every Amiga)
+#   make                   → amiagent + amimon (68000 baseline; runs on every Amiga)
 #   make CPU=68020         → 68020+ build
 #   make OWNBASES=1        → open intuition/graphics by hand (see below)
 #
@@ -22,12 +22,15 @@ ifdef OWNBASES
 CFLAGS += -DAMIAGENT_OWN_LIBBASES
 endif
 
-all: amiagent
+all: amiagent amimon
 
-amiagent: amiagent.c proto.h
+amiagent: amiagent.c proto.h status.h
 	$(CC) $(CFLAGS) -o $@ amiagent.c $(LDFLAGS)
 
+amimon: amimon.c proto.h status.h
+	$(CC) $(CFLAGS) -o $@ amimon.c $(LDFLAGS)
+
 clean:
-	rm -f amiagent
+	rm -f amiagent amimon
 
 .PHONY: all clean

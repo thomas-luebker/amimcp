@@ -60,6 +60,7 @@ typedef long ssize_t;
 #include <string.h>
 
 #include "proto.h"
+#include "status.h"
 
 struct Library *SocketBase = NULL;
 /* Opened on demand: only truecolor screens need it, and plenty of Amigas do
@@ -104,6 +105,47 @@ static void say(const char *fmt, ...)
     vprintf(fmt, ap);
     va_end(ap);
     fflush(stdout);
+}
+
+/* ------------------------------------------------------------------ *
+ * Status board
+ *
+ * A named public semaphore wrapping one struct (see status.h), so a local
+ * program - amimon is the one that exists - can show what the agent is doing
+ * without opening a socket. The board is static memory in this binary, which
+ * is why board_close() must drain readers before main() returns: a reader
+ * still holding the semaphore when the seglist unloads would be reading freed
+ * RAM, and on AmigaOS that does not fail politely.
+ * ------------------------------------------------------------------ */
+
+static struct agent_board g_board;
+static char g_board_name[] = AGENT_BOARD_NAME;
+
+static void board_open(UWORD port)
+{
+    memset(&g_board, 0, sizeof g_board);
+    g_board.sem.ss_Link.ln_Name = g_board_name;
+    g_board.sem.ss_Link.ln_Pri = 0;
+    g_board.board_version = AGENT_BOARD_VERSION;
+    g_board.state = AGS_IDLE;
+    g_board.tcp_port = port;
+    g_board.have_token = (UWORD)g_have_token;
+    strcpy(g_board.agent_version, AMIAGENT_VERSION);
+    strcpy(g_board.activity, "waiting for a connection");
+    DateStamp(&g_board.started);
+    AddSemaphore(&g_board.sem);   /* initializes AND publishes; OS 2.04+ only */
+}
+
+static void board_close(void)
+{
+    /* Unlist first so no new reader can find it, then obtain exclusively,
+     * which queues behind every reader already inside. When it returns, the
+     * board is ours alone and the memory may go away. */
+    Forbid();
+    RemSemaphore(&g_board.sem);
+    Permit();
+    ObtainSemaphore(&g_board.sem);
+    ReleaseSemaphore(&g_board.sem);
 }
 
 /* ------------------------------------------------------------------ *
@@ -196,6 +238,7 @@ static int send_resp(int sock, UBYTE status, const void *payload, ULONG len)
 
 static int send_err(int sock, const char *msg)
 {
+    g_board.failures++;   /* bare ULONG bump: only this process writes it */
     return send_resp(sock, ST_ERR, msg, (ULONG)strlen(msg));
 }
 
@@ -480,6 +523,13 @@ static int do_exec(int sock, const UBYTE *payload, ULONG len)
     g_job.started = 0;
 
     say("exec: %s\n", g_job.cmd);
+
+    ObtainSemaphore(&g_board.sem);
+    g_board.cmds++;
+    strncpy(g_board.lastcmd, g_job.cmd, sizeof g_board.lastcmd - 1);
+    g_board.lastcmd[sizeof g_board.lastcmd - 1] = '\0';
+    ReleaseSemaphore(&g_board.sem);
+
     cli_snapshot(g_job.clis);
 
     SetSignal(0, 1UL << g_job.sigbit);   /* clear any stale completion signal */
@@ -1455,6 +1505,99 @@ static int do_input(int sock, const UBYTE *p, ULONG len)
 }
 
 /* ------------------------------------------------------------------ *
+ * Status board, request half
+ * ------------------------------------------------------------------ */
+
+static const char *cmd_name(UBYTE code)
+{
+    switch (code) {
+    case CMD_PING:    return "PING";
+    case CMD_EXEC:    return "EXEC";
+    case CMD_GET:     return "GET";
+    case CMD_PUT:     return "PUT";
+    case CMD_LIST:    return "LIST";
+    case CMD_INFO:    return "INFO";
+    case CMD_SHOT:    return "SHOT";
+    case CMD_INPUT:   return "INPUT";
+    case CMD_BREAK:   return "BREAK";
+    case CMD_SCREENS: return "SCREENS";
+    case CMD_POINTER: return "POINTER";
+    case CMD_HASH:    return "HASH";
+    default:          return "?";
+    }
+}
+
+/* Mark a request as in progress: "EXEC: dir sys:" while it runs, and the same
+ * text stays up afterwards as "the last thing that happened". Payload text is
+ * clipped and de-fanged - it came off the wire, and a control character would
+ * otherwise end up rendered into somebody's window. */
+static void board_begin(UBYTE code, const UBYTE *body, ULONG got,
+                        const char *client)
+{
+    const UBYTE *txt = NULL;
+    ULONG n = 0, i;
+    char snip[64];
+
+    switch (code) {
+    case CMD_EXEC:                       /* skip the u16 deadline prefix */
+        if (got > 2) { txt = body + 2; n = got - 2; }
+        break;
+    case CMD_GET:
+    case CMD_LIST:
+        txt = body; n = got;
+        break;
+    case CMD_PUT:                        /* u16 pathlen + path + data */
+        if (got >= 2) {
+            ULONG pl = ((ULONG)body[0] << 8) | body[1];
+            if (pl + 2 <= got) { txt = body + 2; n = pl; }
+        }
+        break;
+    }
+    if (n > sizeof snip - 1) n = sizeof snip - 1;
+    for (i = 0; i < n; i++) {
+        UBYTE c = txt[i];
+        snip[i] = (c < 32 || c > 126) ? '.' : (char)c;
+    }
+    snip[n] = '\0';
+
+    ObtainSemaphore(&g_board.sem);
+    g_board.state = AGS_BUSY;
+    if (n) sprintf(g_board.activity, "%s: %s", cmd_name(code), snip);
+    else   strcpy(g_board.activity, cmd_name(code));
+    if (client) {
+        strncpy(g_board.client, client, sizeof g_board.client - 1);
+        g_board.client[sizeof g_board.client - 1] = '\0';
+    }
+    ReleaseSemaphore(&g_board.sem);
+}
+
+static void board_done(void)
+{
+    ObtainSemaphore(&g_board.sem);
+    g_board.requests++;
+    if (g_job.busy && !g_job.done) {
+        g_board.state = AGS_CMDRUN;
+        sprintf(g_board.activity, "running: %.80s", g_job.cmd);
+    } else {
+        g_board.state = AGS_IDLE;
+    }
+    ReleaseSemaphore(&g_board.sem);
+}
+
+/* Called from the accept loop's timeout tick: an EXEC that outlived its
+ * deadline finishes long after any request was around to notice, and without
+ * this the board would say "running" until the next client happened by. */
+static void board_poll_job(void)
+{
+    if (g_board.state != AGS_CMDRUN) return;
+    if (g_job.busy && !g_job.done) return;
+    ObtainSemaphore(&g_board.sem);
+    g_board.state = AGS_IDLE;
+    sprintf(g_board.activity, "finished: %.80s", g_job.cmd);
+    ReleaseSemaphore(&g_board.sem);
+}
+
+/* ------------------------------------------------------------------ *
  * Connection loop
  * ------------------------------------------------------------------ */
 
@@ -1477,7 +1620,7 @@ static int read_frame(int sock, UBYTE *code, ULONG *len, UBYTE *body, ULONG pref
     return 1;
 }
 
-static void serve(int sock)
+static void serve(int sock, const char *client)
 {
     UBYTE *body = NULL;
     UBYTE code;
@@ -1517,6 +1660,25 @@ static void serve(int sock)
             break;
         }
 
+        /* An informational client label for the status board. Handled before
+         * board_begin so it does not overwrite the activity line with itself -
+         * it is metadata about the connection, not a request to display. */
+        if (code == CMD_HELLO) {
+            ULONG n = got < sizeof g_board.driver - 1 ? got : sizeof g_board.driver - 1;
+            ULONG i;
+            ObtainSemaphore(&g_board.sem);
+            for (i = 0; i < n; i++) {
+                UBYTE c = body[i];
+                g_board.driver[i] = (c < 32 || c > 126) ? '.' : (char)c;
+            }
+            g_board.driver[n] = '\0';
+            ReleaseSemaphore(&g_board.sem);
+            send_resp(sock, ST_OK, NULL, 0);
+            break;
+        }
+
+        board_begin(code, body, got, client);
+
         switch (code) {
         case CMD_PING: do_ping(sock); break;
         case CMD_EXEC: do_exec(sock, body, len); break;
@@ -1532,6 +1694,8 @@ static void serve(int sock)
         case CMD_BREAK: do_break(sock); break;
         default:       send_err(sock, "unknown command"); break;
         }
+
+        board_done();
 
         /* One command per connection, so the client always knows exactly what
          * state the socket is in. AUTH is the one exception, handled above. */
@@ -1616,21 +1780,28 @@ int main(void)
     printf("Press Ctrl-C to stop.%s\n", g_quiet ? "  (VERBOSE for per-command output)" : "");
     fflush(stdout);
 
+    board_open((UWORD)port);
+
     for (;;) {
         struct sockaddr_in ca;
         socklen_t calen = sizeof ca;
         int cs;
-        int r = sock_readable(listener, -1);
+        /* A finite wait rather than forever: the tick is what lets the status
+         * board notice a background command finishing while no client is
+         * around. Two seconds of granularity costs nothing. */
+        int r = sock_readable(listener, 2);
 
         if (r < 0) { say("\namiagent: stopping.\n"); break; }
-        if (r == 0) continue;
+        if (r == 0) { board_poll_job(); continue; }
 
         cs = accept(listener, (struct sockaddr *)&ca, &calen);
         if (cs < 0) continue;
 
-        serve(cs);
+        serve(cs, (const char *)Inet_NtoA(ca.sin_addr.s_addr));
         CloseSocket(cs);
     }
+
+    board_close();
 
 out:
     input_close();

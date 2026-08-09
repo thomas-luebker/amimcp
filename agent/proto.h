@@ -29,6 +29,10 @@
 #define CMD_POINTER 0x0B
 #define CMD_HASH 0x0C
 #define CMD_AUTH 0x10
+#define CMD_HELLO 0x11  /* client announces what is driving it, as text. Purely
+                         * informational and unverifiable - the agent stores it
+                         * for the local status board (see status.h) and nothing
+                         * gates on it. Reply is empty OK. */
 
 /* CMD_SHOT payload is optional, and omitting it means "the whole frontmost
  * screen" exactly as before:
@@ -110,6 +114,6 @@
 #define SHOT_CHUNKY 1   /* palette + 1 byte/pixel */
 #define SHOT_RGB24  2   /* 3 bytes/pixel, no palette */
 
-#define AMIAGENT_VERSION "0.5.5"
+#define AMIAGENT_VERSION "0.6.1"
 
 #endif /* AMIMCP_PROTO_H */
