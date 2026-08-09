@@ -16,3 +16,6 @@ tools/amibench/amibench
 # Release archives
 dist/
 tools/lhapack/.build/
+
+# amifleet Swift build artifacts
+tools/amifleet/.build/

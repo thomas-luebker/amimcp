@@ -334,6 +334,7 @@ server/png.py        chunky/RGB → PNG, stdlib zlib
 tests/fake_agent.py  host-side stand-in for the Amiga
 tests/               end-to-end and protocol-drift tests
 tools/amibench/      CPU/memory benchmark for comparing Amigas
+tools/amifleet/      macOS fleet console — ARD-style tiles, shell, live screen
 tools/lhapack/       builds the release archive (macOS has no LHA writer)
 tools/mkicon/        writes the .info icons (classic planar + GlowIcon)
 install.sh           register with Claude Code
