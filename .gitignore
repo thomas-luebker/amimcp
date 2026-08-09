@@ -22,3 +22,8 @@ tools/amifleet/.build/
 
 # amifleet packaging output
 tools/amifleet/build/
+
+# amifleet Xcode project (generated locally; assets + guide are tracked)
+tools/amifleet/xcode/*.xcodeproj/
+tools/amifleet/xcode/amifleet/
+tools/amifleet/xcode/build/
