@@ -1210,6 +1210,147 @@ static int do_pointer(int sock)
 }
 
 /* ------------------------------------------------------------------ *
+ * Intuition object walker (SPIKE)
+ * ------------------------------------------------------------------ *
+ * A read-only, semantic snapshot of the frontmost screen: its windows and
+ * their gadgets, with roles, labels and click-ready absolute bounds. This is
+ * the "accessibility tree" complement to CMD_SHOT - the client can reason
+ * about the GUI (find the button labelled "OK") instead of hunting pixels.
+ * Standard Intuition/GadTools gadgets only; custom screens and bitmap content
+ * are invisible here, which is exactly what CMD_SHOT remains for.
+ *
+ * Walked entirely under Forbid() so the window/gadget lists cannot mutate
+ * mid-traversal, into a fixed static buffer (no allocation while forbidden).
+ *
+ * Line format, one record per line, X/Y/W/H in absolute screen pixels:
+ *   S 0 WxH depth=D "title"
+ *   W idx X Y WxH state "title"
+ *   G id X Y WxH kind state "label" ["value"]
+ * A click at X+W/2, Y+H/2 of a G record lands on that gadget.
+ */
+#define UITREE_MAX 16000
+static char g_uitree[UITREE_MAX + 16];
+
+/* Clip src into a fixed field, defanging quotes and control characters so the
+ * one-line text format stays parseable (and a hostile window title cannot
+ * inject newlines into the reply). */
+static void ui_san(char *dst, size_t dstsz, const char *src)
+{
+    size_t i = 0;
+    if (!src) { dst[0] = '\0'; return; }
+    for (; src[i] && i < dstsz - 1; i++) {
+        unsigned char c = (unsigned char)src[i];
+        dst[i] = (c < 32 || c > 126 || c == '"') ? ' ' : (char)c;
+    }
+    dst[i] = '\0';
+}
+
+static const char *ui_kind(UWORD gt)
+{
+    if (gt & GTYP_SYSGADGET) {
+        switch (gt & GTYP_SYSTYPEMASK) {
+        case GTYP_SIZING:    return "sys:size";
+        case GTYP_WDRAGGING: return "sys:drag";
+        case GTYP_WDEPTH:    return "sys:depth";
+        case GTYP_WZOOM:     return "sys:zoom";
+        case GTYP_CLOSE:     return "sys:close";
+        case GTYP_ICONIFY:   return "sys:iconify";
+        default:             return "sys";
+        }
+    }
+    switch (gt & GTYP_GTYPEMASK) {
+    case GTYP_BOOLGADGET:   return "button";
+    case GTYP_STRGADGET:    return "string";
+    case GTYP_PROPGADGET:   return "prop";
+    case GTYP_CUSTOMGADGET: return "custom";
+    default:                return "gadget";
+    }
+}
+
+static ULONG ui_put(ULONG at, const char *s, int *trunc)
+{
+    ULONG n = (ULONG)strlen(s);
+    if (at + n >= UITREE_MAX) { *trunc = 1; return at; }
+    memcpy(g_uitree + at, s, n);
+    return at + n;
+}
+
+static int do_uitree(int sock)
+{
+    struct Screen *scr;
+    struct Window *w;
+    struct Gadget *g;
+    ULONG at = 0;
+    int wi = 0, trunc = 0;
+    char field[64], val[80], line[300];
+
+    if (!gfx_ready(sock)) return 0;
+
+    Forbid();
+    scr = IntuitionBase->FirstScreen;                    /* frontmost screen */
+    if (scr) {
+        ui_san(field, sizeof field, (const char *)scr->Title);
+        sprintf(line, "S 0 %dx%d depth=%d \"%s\"\n",
+                (int)scr->Width, (int)scr->Height,
+                (int)GetBitMapAttr(scr->RastPort.BitMap, BMA_DEPTH), field);
+        at = ui_put(at, line, &trunc);
+
+        for (w = scr->FirstWindow; w && !trunc; w = w->NextWindow, wi++) {
+            ui_san(field, sizeof field, (const char *)w->Title);
+            sprintf(line, "W %d %d %d %dx%d %s \"%s\"\n", wi,
+                    (int)w->LeftEdge, (int)w->TopEdge,
+                    (int)w->Width, (int)w->Height,
+                    (w->Flags & WFLG_WINDOWACTIVE) ? "active" : "-", field);
+            at = ui_put(at, line, &trunc);
+
+            for (g = w->FirstGadget; g && !trunc; g = g->NextGadget) {
+                int gx = g->LeftEdge, gy = g->TopEdge;
+                int gw = g->Width,    gh = g->Height;
+                int labk = g->Flags & GFLG_LABELMASK;
+                const char *state;
+
+                /* Resolve the relative-edge flags to an absolute screen box,
+                 * so X+W/2,Y+H/2 is directly clickable. */
+                if (g->Flags & GFLG_RELRIGHT)  gx += w->Width;
+                if (g->Flags & GFLG_RELBOTTOM) gy += w->Height;
+                if (g->Flags & GFLG_RELWIDTH)  gw += w->Width;
+                if (g->Flags & GFLG_RELHEIGHT) gh += w->Height;
+                gx += w->LeftEdge; gy += w->TopEdge;
+
+                field[0] = '\0';
+                if (labk == GFLG_LABELITEXT && g->GadgetText && g->GadgetText->IText)
+                    ui_san(field, sizeof field, (const char *)g->GadgetText->IText);
+                else if (labk == 0x1000 /* GFLG_LABELSTRING */ && g->GadgetText)
+                    ui_san(field, sizeof field, (const char *)g->GadgetText);
+
+                val[0] = '\0';
+                if ((g->GadgetType & GTYP_GTYPEMASK) == GTYP_STRGADGET && g->SpecialInfo) {
+                    struct StringInfo *si = (struct StringInfo *)g->SpecialInfo;
+                    if (si->Buffer) {
+                        char tmp[48];
+                        ui_san(tmp, sizeof tmp, (const char *)si->Buffer);
+                        sprintf(val, " \"%s\"", tmp);
+                    }
+                }
+
+                state = (g->Flags & GFLG_DISABLED) ? "disabled"
+                      : (g->Flags & GFLG_SELECTED) ? "selected" : "-";
+
+                sprintf(line, "G %d %d %d %dx%d %s %s \"%s\"%s\n",
+                        (int)g->GadgetID, gx, gy, gw, gh,
+                        ui_kind(g->GadgetType), state, field, val);
+                at = ui_put(at, line, &trunc);
+            }
+        }
+    }
+    Permit();
+
+    if (trunc) at = ui_put(at, "; truncated\n", &trunc);
+    say("uitree: %ld bytes%s\n", (long)at, trunc ? " (truncated)" : "");
+    return send_resp(sock, ST_OK, (UBYTE *)g_uitree, at);
+}
+
+/* ------------------------------------------------------------------ *
  * Input injection
  * ------------------------------------------------------------------ */
 
@@ -1523,6 +1664,7 @@ static const char *cmd_name(UBYTE code)
     case CMD_SCREENS: return "SCREENS";
     case CMD_POINTER: return "POINTER";
     case CMD_HASH:    return "HASH";
+    case CMD_UITREE:  return "UITREE";
     default:          return "?";
     }
 }
@@ -1690,6 +1832,7 @@ static void serve(int sock, const char *client)
         case CMD_HASH: do_hash(sock, body, len); break;
         case CMD_SCREENS: do_screens(sock); break;
         case CMD_POINTER: do_pointer(sock); break;
+        case CMD_UITREE: do_uitree(sock); break;
         case CMD_INPUT: do_input(sock, body, len); break;
         case CMD_BREAK: do_break(sock); break;
         default:       send_err(sock, "unknown command"); break;

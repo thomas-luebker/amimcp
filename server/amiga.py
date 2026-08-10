@@ -27,6 +27,7 @@ CMD_BREAK = 0x09
 CMD_SCREENS = 0x0A
 CMD_POINTER = 0x0B
 CMD_HASH = 0x0C
+CMD_UITREE = 0x0D
 CMD_AUTH = 0x10
 
 # CMD_INPUT ops (see agent/proto.h)
@@ -267,6 +268,15 @@ class Amiga:
                 k, v = line.split("=", 1)
                 info[k] = v
         return info
+
+    def ui_tree(self) -> str:
+        """SPIKE: the frontmost screen's Intuition window/gadget tree as text.
+
+        The semantic complement to a screenshot — windows and gadgets with
+        roles, labels and absolute click-ready bounds. Standard Intuition/
+        GadTools GUIs only; custom-rendered screens are invisible here.
+        """
+        return self._request(CMD_UITREE).decode("latin-1", "replace")
 
     # -- input injection --------------------------------------------------
 

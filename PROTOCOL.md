@@ -54,6 +54,7 @@ exception: it precedes the real request on the same connection.
 | 0x0A | `SCREENS` | *(empty)*                         | Open screens, front to back |
 | 0x0B | `POINTER` | *(empty)*                         | `x`, `y`, `screen_w`, `screen_h` (u16 each) |
 | 0x0C | `HASH` | Same as `SHOT`                       | `checksum` (u32) |
+| 0x0D | `UITREE` | *(empty)*                         | Intuition object tree, text |
 | 0x10 | `AUTH` | Shared token, text                   | *(empty)* |
 
 Text payloads are **not** NUL-terminated; the frame length delimits them.
@@ -184,6 +185,34 @@ u16 x, u16 y, u16 screen_w, u16 screen_h
 Where Intuition's pointer is — cheap enough to ask before every click. Note that
 a program tracking raw mouse deltas keeps a cursor of its own that nothing else
 can see; see *Absolute versus relative pointer motion* below.
+
+## `UITREE` response (spike)
+
+The semantic complement to `SHOT`: a text dump of the **frontmost screen's**
+Intuition window and gadget tree, so a client can find "the button labelled OK"
+instead of hunting pixels. One record per line, `X Y W H` in absolute screen
+pixels — a click at `X + W/2, Y + H/2` of a `G` record lands on that gadget:
+
+```
+S 0 WxH depth=D "title"                     the frontmost screen
+W idx X Y WxH state "title"                 a window (state: active | -)
+G id X Y WxH kind state "label" ["value"]   a gadget
+```
+
+`kind` is `button` / `string` / `prop` / `custom` for application gadgets,
+`sys:close|drag|depth|zoom|size|iconify` for Intuition's own, or `gadget` when
+the low-level type carries no hint (most GadTools gadgets). `label` comes from
+the gadget's `GadgetText`; `value` is the live contents of a string gadget.
+
+**Scope and limits.** This sees standard Intuition/GadTools gadgets only.
+Custom-drawn content — games, SDL, a Guru — is invisible (that is what `SHOT`
+is for). MUI and other BOOPSI/custom-class GUIs report their windows and the
+bounding boxes of their custom gadgets, but not the inner semantic tree, since
+those classes render themselves rather than exposing standard gadgets. GadTools
+`TEXT_KIND` displays give up their *label* but not their shown *value* (that
+text lives in GadTools' private state, not a readable struct field). Walked
+under `Forbid()` into a fixed 16 KB buffer; a very large tree is truncated with
+a trailing `; truncated` line.
 
 ## `SHOT` response
 
