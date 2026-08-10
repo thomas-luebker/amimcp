@@ -214,6 +214,29 @@ text lives in GadTools' private state, not a readable struct field). Walked
 under `Forbid()` into a fixed 16 KB buffer; a very large tree is truncated with
 a trailing `; truncated` line.
 
+## `UIACT` request (spike)
+
+Act on a gadget by identity rather than a guessed coordinate. Tab-separated
+text payload:
+
+```
+verb \t window \t gadget [\t text]
+```
+
+- `verb` — `click`, `dclick`, or `settext`.
+- `window` — a title substring or a window index; empty means any window.
+- `gadget` — a `GadgetID` (numeric) or a case-insensitive substring of the
+  gadget's **label or role** (so `close` finds the window's close gadget and
+  `OK` finds an OK button).
+- `text` — for `settext` only: the string to place (the gadget is focused,
+  cleared with right-Amiga+X, and the text typed, then Return).
+
+The agent resolves the match to its click centre using the same walk as
+`UITREE` (under `Forbid()`), then drives the click through the normal input
+path. Reply is a short text summary (`click at 50,45`) on success, or `ST_ERR`
+("no matching gadget") when nothing matched. Same standard-GUI scope as
+`UITREE`.
+
 ## `SHOT` response
 
 ```

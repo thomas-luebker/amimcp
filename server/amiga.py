@@ -28,6 +28,7 @@ CMD_SCREENS = 0x0A
 CMD_POINTER = 0x0B
 CMD_HASH = 0x0C
 CMD_UITREE = 0x0D
+CMD_UIACT = 0x0E
 CMD_AUTH = 0x10
 
 # CMD_INPUT ops (see agent/proto.h)
@@ -277,6 +278,27 @@ class Amiga:
         GadTools GUIs only; custom-rendered screens are invisible here.
         """
         return self._request(CMD_UITREE).decode("latin-1", "replace")
+
+    def _uiact(self, verb: str, gadget: str, window: str = "", text: str = "") -> str:
+        parts = [verb, window, str(gadget)]
+        if verb == "settext":
+            parts.append(text)
+        payload = "\t".join(parts).encode("latin-1", "replace")
+        return self._request(CMD_UIACT, payload).decode("latin-1", "replace")
+
+    def ui_click(self, gadget: str, window: str = "", double: bool = False) -> str:
+        """SPIKE: click a gadget by identity, not coordinates.
+
+        `gadget` is a GadgetID (numeric) or a case-insensitive label substring;
+        `window` optionally scopes it by title substring or index. The agent
+        resolves the gadget to its centre and clicks it. Raises AmigaError if
+        nothing matches. Standard Intuition/GadTools GUIs only.
+        """
+        return self._uiact("dclick" if double else "click", gadget, window)
+
+    def ui_set(self, gadget: str, text: str, window: str = "") -> str:
+        """SPIKE: focus a string gadget by identity, clear it, and type `text`."""
+        return self._uiact("settext", gadget, window, text)
 
     # -- input injection --------------------------------------------------
 

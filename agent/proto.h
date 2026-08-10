@@ -35,6 +35,14 @@
                          * (see do_uitree in amiagent.c). Standard Intuition/
                          * GadTools GUIs only; custom screens are invisible
                          * (that is what CMD_SHOT is for). */
+#define CMD_UIACT 0x0E  /* Act on a gadget by identity, not coordinates. Text
+                         * payload, tab-separated: "verb\twindow\tgadget[\ttext]"
+                         * where verb is click|dclick|settext, window is a title
+                         * substring or index (empty = any), gadget is a
+                         * GadgetID or label substring. The agent resolves the
+                         * gadget to its click centre (same walk as CMD_UITREE)
+                         * and drives the click through the input path. Reply is
+                         * a short text summary, or ST_ERR if nothing matched. */
 #define CMD_AUTH 0x10
 #define CMD_HELLO 0x11  /* client announces what is driving it, as text. Purely
                          * informational and unverifiable - the agent stores it

@@ -1275,6 +1275,54 @@ static ULONG ui_put(ULONG at, const char *s, int *trunc)
     return at + n;
 }
 
+/* Nonempty and all decimal digits? Tells a numeric selector (window index /
+ * GadgetID) from a text one (title / label substring). */
+static int ui_is_num(const char *s)
+{
+    if (!s || !*s) return 0;
+    for (; *s; s++) if (*s < '0' || *s > '9') return 0;
+    return 1;
+}
+
+static int ui_num(const char *s)
+{
+    int v = 0;
+    for (; *s >= '0' && *s <= '9'; s++) v = v * 10 + (*s - '0');
+    return v;
+}
+
+/* Case-insensitive substring test (needle within haystack). Empty needle
+ * matches anything; a NULL haystack matches nothing. */
+static int ui_ci_contains(const char *hay, const char *needle)
+{
+    size_t nl, k;
+    if (!needle || !needle[0]) return 1;
+    if (!hay) return 0;
+    nl = strlen(needle);
+    for (; *hay; hay++) {
+        for (k = 0; k < nl; k++) {
+            int a = hay[k], b = needle[k];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (!hay[k] || a != b) break;
+        }
+        if (k == nl) return 1;
+    }
+    return 0;
+}
+
+/* A gadget's text label (GadTools/plain Intuition), into dst. Empty if the
+ * gadget labels with an image or has no text. */
+static void ui_label(struct Gadget *g, char *dst, size_t dstsz)
+{
+    int labk = g->Flags & GFLG_LABELMASK;
+    dst[0] = '\0';
+    if (labk == GFLG_LABELITEXT && g->GadgetText && g->GadgetText->IText)
+        ui_san(dst, dstsz, (const char *)g->GadgetText->IText);
+    else if (labk == 0x1000 /* GFLG_LABELSTRING */ && g->GadgetText)
+        ui_san(dst, dstsz, (const char *)g->GadgetText);
+}
+
 static int do_uitree(int sock)
 {
     struct Screen *scr;
@@ -1306,7 +1354,6 @@ static int do_uitree(int sock)
             for (g = w->FirstGadget; g && !trunc; g = g->NextGadget) {
                 int gx = g->LeftEdge, gy = g->TopEdge;
                 int gw = g->Width,    gh = g->Height;
-                int labk = g->Flags & GFLG_LABELMASK;
                 const char *state;
 
                 /* Resolve the relative-edge flags to an absolute screen box,
@@ -1317,11 +1364,7 @@ static int do_uitree(int sock)
                 if (g->Flags & GFLG_RELHEIGHT) gh += w->Height;
                 gx += w->LeftEdge; gy += w->TopEdge;
 
-                field[0] = '\0';
-                if (labk == GFLG_LABELITEXT && g->GadgetText && g->GadgetText->IText)
-                    ui_san(field, sizeof field, (const char *)g->GadgetText->IText);
-                else if (labk == 0x1000 /* GFLG_LABELSTRING */ && g->GadgetText)
-                    ui_san(field, sizeof field, (const char *)g->GadgetText);
+                ui_label(g, field, sizeof field);
 
                 val[0] = '\0';
                 if ((g->GadgetType & GTYP_GTYPEMASK) == GTYP_STRGADGET && g->SpecialInfo) {
@@ -1487,6 +1530,23 @@ static void input_button(UBYTE button, int down)
     input_post(&ie);
 }
 
+/* A full click gesture at an absolute screen position: warp, settle, then
+ * press/release `count` times. Shared by the IN_CLICK op and CMD_UIACT so the
+ * timing lives in one place. Caller must have called input_open() first. */
+static void input_click(WORD x, WORD y, UBYTE button, UBYTE count)
+{
+    UBYTE n;
+    if (!count) count = 1;
+    input_move(x, y);
+    Delay(2);   /* let Intuition settle on the new pointer position */
+    for (n = 0; n < count; n++) {
+        input_button(button, 1);
+        Delay(2);
+        input_button(button, 0);
+        if (n + 1 < count) Delay(2);
+    }
+}
+
 static void input_key(UBYTE raw, int down, UWORD qual)
 {
     struct InputEvent ie;
@@ -1622,18 +1682,9 @@ static int do_input(int sock, const UBYTE *p, ULONG len)
     }
 
     case IN_CLICK: {
-        UBYTE button, count, n;
         if (len < 6) return send_err(sock, "CLICK needs x,y,button,count");
-        input_move((WORD)((p[0] << 8) | p[1]), (WORD)((p[2] << 8) | p[3]));
-        button = p[4];
-        count = p[5] ? p[5] : 1;
-        Delay(2);   /* let Intuition settle on the new pointer position */
-        for (n = 0; n < count; n++) {
-            input_button(button, 1);
-            Delay(2);
-            input_button(button, 0);
-            if (n + 1 < count) Delay(2);
-        }
+        input_click((WORD)((p[0] << 8) | p[1]), (WORD)((p[2] << 8) | p[3]),
+                    p[4], p[5]);
         break;
     }
 
@@ -1643,6 +1694,106 @@ static int do_input(int sock, const UBYTE *p, ULONG len)
 
     say("input: op %ld\n", (long)op);
     return send_resp(sock, ST_OK, NULL, 0);
+}
+
+/* ------------------------------------------------------------------ *
+ * Act by object (CMD_UIACT) - the semantic complement to raw INPUT
+ * ------------------------------------------------------------------ *
+ * Resolve a window+gadget selector to a click centre the way do_uitree
+ * reports it, then drive the click through the same input path - so a client
+ * clicks "the OK button" rather than a pixel it guessed. Resolution runs under
+ * its own Forbid(); the click happens after Permit() (posting input events
+ * must not be done while forbidden). */
+static int ui_find(const char *win, const char *gsel, WORD *cx, WORD *cy)
+{
+    struct Screen *scr;
+    struct Window *w;
+    struct Gadget *g;
+    int wi = 0, found = 0;
+    int want_wnum = ui_is_num(win) ? ui_num(win) : -1;
+    int gnum = ui_is_num(gsel) ? ui_num(gsel) : -1;
+
+    Forbid();
+    scr = IntuitionBase->FirstScreen;                    /* frontmost screen */
+    for (w = scr ? scr->FirstWindow : NULL; w && !found; w = w->NextWindow, wi++) {
+        if (want_wnum >= 0) { if (wi != want_wnum) continue; }
+        else if (win && win[0] && !ui_ci_contains((const char *)w->Title, win)) continue;
+
+        for (g = w->FirstGadget; g && !found; g = g->NextGadget) {
+            char label[64];
+            int match;
+            if (gnum >= 0) {
+                match = ((int)g->GadgetID == gnum);
+            } else if (gsel && gsel[0]) {
+                /* Match the visible label OR the role name, so "OK" finds a
+                 * button and "close" finds the window's close gadget. */
+                ui_label(g, label, sizeof label);
+                match = ui_ci_contains(label, gsel)
+                     || ui_ci_contains(ui_kind(g->GadgetType), gsel);
+            } else {
+                match = 0;
+            }
+            if (!match) continue;
+            {
+                int gx = g->LeftEdge, gy = g->TopEdge, gw = g->Width, gh = g->Height;
+                if (g->Flags & GFLG_RELRIGHT)  gx += w->Width;
+                if (g->Flags & GFLG_RELBOTTOM) gy += w->Height;
+                if (g->Flags & GFLG_RELWIDTH)  gw += w->Width;
+                if (g->Flags & GFLG_RELHEIGHT) gh += w->Height;
+                *cx = (WORD)(w->LeftEdge + gx + gw / 2);
+                *cy = (WORD)(w->TopEdge + gy + gh / 2);
+                found = 1;
+            }
+        }
+    }
+    Permit();
+    return found;
+}
+
+static int do_uiact(int sock, const UBYTE *body, ULONG len)
+{
+    char req[256], msg[80];
+    char *verb, *win, *gsel, *text = NULL;
+    WORD cx, cy;
+    ULONG n = len < sizeof req - 1 ? len : sizeof req - 1;
+
+    memcpy(req, body, n); req[n] = '\0';
+
+    /* tab-separated: verb \t window \t gadget [\t text] */
+    verb = req;
+    win = strchr(req, '\t');
+    if (!win) return send_err(sock, "UIACT: verb\\twindow\\tgadget");
+    *win++ = '\0';
+    gsel = strchr(win, '\t');
+    if (!gsel) return send_err(sock, "UIACT: missing gadget");
+    *gsel++ = '\0';
+    text = strchr(gsel, '\t');
+    if (text) *text++ = '\0';
+
+    if (!input_open()) return send_err(sock, "cannot open input.device");
+    if (!ui_find(win, gsel, &cx, &cy))
+        return send_err(sock, "no matching gadget");
+
+    if (strcmp(verb, "click") == 0) {
+        input_click(cx, cy, IN_BTN_LEFT, 1);
+    } else if (strcmp(verb, "dclick") == 0) {
+        input_click(cx, cy, IN_BTN_LEFT, 2);
+    } else if (strcmp(verb, "settext") == 0) {
+        const char *t;
+        input_click(cx, cy, IN_BTN_LEFT, 1);         /* focus the string gadget */
+        Delay(3);
+        input_key(0x32, 1, IEQUALIFIER_RCOMMAND);    /* right-Amiga+X: clear line */
+        input_key(0x32, 0, IEQUALIFIER_RCOMMAND);
+        for (t = text ? text : ""; *t; t++) input_char((UBYTE)*t);
+        input_key(0x44, 1, 0);                       /* Return: confirm */
+        input_key(0x44, 0, 0);
+    } else {
+        return send_err(sock, "UIACT verb must be click|dclick|settext");
+    }
+
+    sprintf(msg, "%s at %d,%d", verb, (int)cx, (int)cy);
+    say("uiact: %s\n", msg);
+    return send_resp(sock, ST_OK, (UBYTE *)msg, (ULONG)strlen(msg));
 }
 
 /* ------------------------------------------------------------------ *
@@ -1665,6 +1816,7 @@ static const char *cmd_name(UBYTE code)
     case CMD_POINTER: return "POINTER";
     case CMD_HASH:    return "HASH";
     case CMD_UITREE:  return "UITREE";
+    case CMD_UIACT:   return "UIACT";
     default:          return "?";
     }
 }
@@ -1833,6 +1985,7 @@ static void serve(int sock, const char *client)
         case CMD_SCREENS: do_screens(sock); break;
         case CMD_POINTER: do_pointer(sock); break;
         case CMD_UITREE: do_uitree(sock); break;
+        case CMD_UIACT: do_uiact(sock, body, len); break;
         case CMD_INPUT: do_input(sock, body, len); break;
         case CMD_BREAK: do_break(sock); break;
         default:       send_err(sock, "unknown command"); break;
