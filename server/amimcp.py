@@ -395,6 +395,44 @@ TOOLS = [
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "amiga_ui_tree",
+        "description": (
+            "The frontmost screen's Intuition window/gadget tree as text — the "
+            "semantic complement to a screenshot. Each line: 'S' the screen, "
+            "'W idx X Y WxH state \"title\"' a window, 'G id X Y WxH kind state "
+            "\"label\" [\"value\"]' a gadget, all in absolute screen pixels. Use "
+            "this to see what windows and gadgets exist and drive them by "
+            "identity (amiga_ui_click) instead of guessing coordinates. Standard "
+            "Intuition/GadTools GUIs only; custom-rendered screens (games, SDL, "
+            "MUI internals, a Guru) are invisible here — screenshot those."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "amiga_ui_click",
+        "description": (
+            "Click a GUI element by identity rather than coordinates. Give a "
+            "gadget (a numeric GadgetID, or a substring of its label or role — "
+            "'close' finds the window's close gadget, 'OK' an OK button) and "
+            "optionally a window (title substring or index) to scope it. The "
+            "agent locates it in the UI tree and clicks its centre. Read the "
+            "tree first with amiga_ui_tree. Errors if nothing matches."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "gadget": {"type": "string", "description":
+                    "GadgetID (numeric) or a case-insensitive substring of the "
+                    "gadget's label or role."},
+                "window": {"type": "string", "description":
+                    "Optional: window title substring or index to scope the search."},
+                "double": {"type": "boolean", "description":
+                    "Double-click instead of single. Default false."},
+            },
+            "required": ["gadget"],
+        },
+    },
 ]
 
 
@@ -573,6 +611,20 @@ def tool_system_info(ami: Amiga, args: dict) -> list[dict]:
     return [{"type": "text", "text": "\n".join(lines)}]
 
 
+def tool_ui_tree(ami: Amiga, args: dict) -> list[dict]:
+    tree = ami.ui_tree().rstrip("\n")
+    return [{"type": "text", "text": tree or "No standard-GUI windows on the frontmost screen."}]
+
+
+def tool_ui_click(ami: Amiga, args: dict) -> list[dict]:
+    gadget = args["gadget"]
+    window = args.get("window", "")
+    result = ami.ui_click(gadget, window=window, double=bool(args.get("double")))
+    # The agent raises (ST_ERR -> AmigaError) when nothing matches, which the
+    # dispatcher already renders as an isError text result.
+    return [{"type": "text", "text": result}]
+
+
 def _qualifier_bits(names) -> int:
     bits = 0
     for n in names or []:
@@ -717,6 +769,8 @@ HANDLERS = {
     "amiga_pointer": tool_pointer,
     "amiga_region_changed": tool_region_changed,
     "amiga_system_info": tool_system_info,
+    "amiga_ui_tree": tool_ui_tree,
+    "amiga_ui_click": tool_ui_click,
 }
 
 
