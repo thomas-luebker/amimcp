@@ -46,11 +46,24 @@ Two halves:
 | `amiga_type` | Type text, mapped through the Amiga's own keymap |
 | `amiga_key` | Press Return, Esc, F-keys and so on, with qualifiers |
 | `amiga_break` | Ctrl-C a command left running by `amiga_shell` |
+| `amiga_ui_tree` | The frontmost screen's window/gadget tree — the semantic view |
+| `amiga_ui_click` | Click a gadget by identity (label/role/id), not coordinates |
+| `amiga_menus` | Enumerate a window's menu strip, with shortcuts |
+| `amiga_menu_select` | Invoke a menu item by name (via its keyboard shortcut) |
 
 Together those are enough to actually work: read a Startup-Sequence and fix it,
 cross-compile a binary and push it over and run it, launch a GUI program and
-drive it by clicking, or just look at what the machine is showing when it has
-gone wrong.
+drive it — **by object** (click "the OK button", pick a menu item) on standard
+Intuition/GadTools GUIs, or by pixels everywhere else — or just look at what the
+machine is showing when it has gone wrong.
+
+The last four are the **semantic layer** (agent 0.8.0+): `amiga_ui_tree` reads
+the Amiga's GUI as a tree of windows and gadgets with roles, labels and
+click-ready bounds, the way a screen reader sees a screen, so Claude drives the
+machine by *what things are* instead of guessing pixels. It sees standard
+Intuition/GadTools GUIs; custom-drawn content (MUI internals, games, a Guru)
+stays the job of `amiga_screenshot`. Amiga-side detail is in
+[PROTOCOL.md](PROTOCOL.md) (`UITREE` / `UIACT` / `MENUS`).
 
 Two things are worth knowing before you drive a GUI:
 
