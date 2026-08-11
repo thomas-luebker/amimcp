@@ -77,6 +77,32 @@ TOOLS = [
         },
     },
     {
+        "name": "amiga_arexx",
+        "description": (
+            "Run an ARexx program on the Amiga and return its return code and "
+            "RESULT. The `source` is the ARexx program itself (not a script "
+            "filename), so it can be a one-liner or several statements. This is "
+            "how you drive ARexx-aware applications: `address 'DOPUS.1'` then a "
+            "command talks to Directory Opus; likewise editors, comms programs, "
+            "players, and many others expose ARexx ports. Needs ARexx running "
+            "(RexxMast) on the Amiga; a non-zero rc is the ARexx error code."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "The ARexx program, e.g. \"return 6*7\" or \"address 'DOPUS.1'; 'command'\".",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Seconds to wait for the ARexx program. Default 60.",
+                },
+            },
+            "required": ["source"],
+        },
+    },
+    {
         "name": "amiga_read_file",
         "description": (
             "Read a file from the Amiga. Use this for Startup-Sequence, "
@@ -499,6 +525,17 @@ def tool_shell(ami: Amiga, args: dict) -> list[dict]:
     return [{"type": "text", "text": text}]
 
 
+def tool_arexx(ami: Amiga, args: dict) -> list[dict]:
+    source = args["source"]
+    timeout = float(args.get("timeout", 60))
+    rc, result = ami.arexx(source, timeout=timeout)
+    header = f"ARexx return code: {rc}"
+    if rc != 0:
+        header += "  (non-zero — ARexx reported an error)"
+    text = f"{header}\n\nRESULT: {result}" if result else f"{header}\n\n(no RESULT)"
+    return [{"type": "text", "text": text}]
+
+
 def tool_read_file(ami: Amiga, args: dict) -> list[dict]:
     path = args["path"]
     encoding = args.get("encoding", "auto")
@@ -801,6 +838,7 @@ def tool_key(ami: Amiga, args: dict) -> list[dict]:
 
 HANDLERS = {
     "amiga_shell": tool_shell,
+    "amiga_arexx": tool_arexx,
     "amiga_break": tool_break,
     "amiga_click": tool_click,
     "amiga_drag": tool_drag,

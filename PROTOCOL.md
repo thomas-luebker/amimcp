@@ -58,8 +58,18 @@ exception: it precedes the real request on the same connection.
 | 0x0E | `UIACT` | `verb\twindow\tgadget[\ttext]`      | Short summary, or `ST_ERR` |
 | 0x0F | `MENUS` | window selector (text, optional)    | Menu strip, text |
 | 0x10 | `AUTH` | Shared token, text                   | *(empty)* |
+| 0x11 | `HELLO`| Driver description, text             | *(empty)* |
+| 0x12 | `AREXX`| ARexx program source, text          | `rc` (u32) + RESULT string |
 
 Text payloads are **not** NUL-terminated; the frame length delimits them.
+
+`AREXX` runs the payload as an ARexx program (via `rexxsyslib` with
+`RXFF_STRING`, so the payload *is* the program, not a script filename). The
+reply is the ARexx primary return code as a `u32`, then the RESULT string
+(empty when `rc` is non-zero) — the same shape as `EXEC`. It needs ARexx
+running on the Amiga (the `REXX` port / RexxMast); otherwise the agent answers
+`ST_ERR`. Because the program can `ADDRESS` any application's ARexx port, this
+is how the fleet drives ARexx-aware apps (editors, DOpus, comms, players).
 
 ## Statuses (response `code`)
 

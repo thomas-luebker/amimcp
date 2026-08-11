@@ -57,6 +57,14 @@
                          * informational and unverifiable - the agent stores it
                          * for the local status board (see status.h) and nothing
                          * gates on it. Reply is empty OK. */
+#define CMD_AREXX 0x12  /* run an ARexx program string on the Amiga. Payload is
+                         * the ARexx source (text), run via rexxsyslib with
+                         * RXFF_STRING so the payload IS the program (not a
+                         * script filename) - so `address 'DOPUS.1'; 'command'`
+                         * drives any ARexx-aware app. Reply is s32 rc (big-
+                         * endian) + the RESULT string (empty when rc != 0),
+                         * mirroring EXEC's (rc, output). ST_ERR if ARexx (the
+                         * REXX port / RexxMast) is not running. */
 
 /* CMD_SHOT payload is optional, and omitting it means "the whole frontmost
  * screen" exactly as before:
@@ -138,6 +146,6 @@
 #define SHOT_CHUNKY 1   /* palette + 1 byte/pixel */
 #define SHOT_RGB24  2   /* 3 bytes/pixel, no palette */
 
-#define AMIAGENT_VERSION "0.8.0"
+#define AMIAGENT_VERSION "0.9.0"
 
 #endif /* AMIMCP_PROTO_H */

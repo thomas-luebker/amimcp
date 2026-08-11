@@ -28,6 +28,7 @@ CMD_SCREENS = 0x0A
 CMD_POINTER = 0x0B
 CMD_HASH = 0x0C
 CMD_UITREE = 0x0D
+CMD_AREXX = 0x12
 CMD_UIACT = 0x0E
 CMD_MENUS = 0x0F
 CMD_AUTH = 0x10
@@ -230,6 +231,23 @@ class Amiga:
     def break_command(self) -> str:
         """Ask the agent to Ctrl-C whatever command is stuck."""
         return self._request(CMD_BREAK).decode("latin-1", "replace")
+
+    def arexx(self, source: str, timeout: float = 60.0) -> tuple[int, str]:
+        """Run an ARexx program string on the Amiga; return (rc, RESULT).
+
+        The `source` is the program itself (not a script filename), so a
+        one-liner like `address 'DOPUS.1'; command` drives any ARexx-aware app.
+        Needs ARexx running (RexxMast); rc is the ARexx primary return code.
+        """
+        body = self._request(
+            CMD_AREXX, source.encode("latin-1"), timeout=max(self.timeout, timeout)
+        )
+        if len(body) < 4:
+            raise AmigaUnreachable("truncated AREXX response")
+        (rc,) = struct.unpack(">I", body[:4])
+        if rc > 0x7FFFFFFF:
+            rc -= 0x100000000
+        return rc, body[4:].decode("latin-1", "replace")
 
     def read_file(self, path: str) -> bytes:
         return self._request(CMD_GET, path.encode("latin-1"))

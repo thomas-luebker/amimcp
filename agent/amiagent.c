@@ -49,6 +49,9 @@ typedef long ssize_t;
 #include <proto/keymap.h>
 #include <inline/cybergraphics.h>
 #include <proto/bsdsocket.h>
+#include <rexx/storage.h>
+#include <rexx/rxslib.h>
+#include <proto/rexxsyslib.h>
 
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -596,6 +599,84 @@ static int do_break(int sock)
                  "moment to notice, and not every program obeys it.",
             (unsigned long)hit);
     return send_resp(sock, ST_OK, msg, (ULONG)strlen(msg));
+}
+
+/* ------------------------------------------------------------------ *
+ * ARexx — run an ARexx program string via rexxsyslib and return its RESULT.
+ * The payload is the program source (RXFF_STRING), so a one-liner like
+ *   address 'DOPUS.1'; command
+ * drives any ARexx-aware application. Needs ARexx running (RexxMast, the
+ * "REXX" port). Reply: s32 rc + RESULT string, like EXEC's (rc, output).
+ * ------------------------------------------------------------------ */
+
+struct RxsLib *RexxSysBase;   /* opened per call; the agent runs one at a time */
+
+static int do_arexx(int sock, const UBYTE *payload, ULONG len)
+{
+    char *cmd;
+    struct MsgPort *reply, *rexxport;
+    struct RexxMsg *rm;
+    LONG rc;
+    char *result = NULL;
+    UBYTE rcbuf[4];
+    ULONG rlen;
+
+    cmd = dup_cstr(payload, len);
+    if (!cmd) return send_err(sock, "out of memory");
+
+    RexxSysBase = (struct RxsLib *)OpenLibrary("rexxsyslib.library", 0);
+    if (!RexxSysBase) { FreeVec(cmd); return send_err(sock, "rexxsyslib.library not available"); }
+
+    reply = CreateMsgPort();
+    if (!reply) {
+        CloseLibrary((struct Library *)RexxSysBase); FreeVec(cmd);
+        return send_err(sock, "could not create a reply port");
+    }
+
+    rm = CreateRexxMsg(reply, NULL, "AMIAGENT");
+    if (!rm) {
+        DeleteMsgPort(reply); CloseLibrary((struct Library *)RexxSysBase); FreeVec(cmd);
+        return send_err(sock, "could not create the ARexx message");
+    }
+    rm->rm_Args[0] = CreateArgstring(cmd, (LONG)strlen(cmd));
+    rm->rm_Action = RXCOMM | RXFF_STRING | RXFF_RESULT;   /* the string IS the program */
+
+    /* Hand it to RexxMast's port, atomically so the port can't vanish under us. */
+    Forbid();
+    rexxport = FindPort("REXX");
+    if (rexxport) PutMsg(rexxport, (struct Message *)rm);
+    Permit();
+
+    if (!rexxport) {
+        DeleteArgstring((STRPTR)rm->rm_Args[0]);
+        DeleteRexxMsg(rm);
+        DeleteMsgPort(reply);
+        CloseLibrary((struct Library *)RexxSysBase);
+        FreeVec(cmd);
+        return send_err(sock, "ARexx is not running (no REXX port - start RexxMast)");
+    }
+
+    WaitPort(reply);
+    while (GetMsg(reply)) { /* exactly one - our own message comes back */ }
+
+    rc = rm->rm_Result1;
+    if (rc == 0 && rm->rm_Result2) result = (char *)rm->rm_Result2;   /* an argstring */
+
+    rcbuf[0] = (UBYTE)(rc >> 24); rcbuf[1] = (UBYTE)(rc >> 16);
+    rcbuf[2] = (UBYTE)(rc >> 8);  rcbuf[3] = (UBYTE)rc;
+    rlen = result ? (ULONG)strlen(result) : 0;
+    if (send_hdr(sock, ST_OK, 4 + rlen)) {
+        send_all(sock, rcbuf, 4);
+        if (rlen) send_all(sock, (const UBYTE *)result, rlen);
+    }
+
+    if (rc == 0 && rm->rm_Result2) DeleteArgstring((STRPTR)rm->rm_Result2);
+    DeleteArgstring((STRPTR)rm->rm_Args[0]);
+    DeleteRexxMsg(rm);
+    DeleteMsgPort(reply);
+    CloseLibrary((struct Library *)RexxSysBase);
+    FreeVec(cmd);
+    return 1;
 }
 
 static int do_get(int sock, const UBYTE *payload, ULONG len)
@@ -1959,6 +2040,7 @@ static const char *cmd_name(UBYTE code)
     case CMD_UITREE:  return "UITREE";
     case CMD_UIACT:   return "UIACT";
     case CMD_MENUS:   return "MENUS";
+    case CMD_AREXX:   return "AREXX";
     default:          return "?";
     }
 }
@@ -1980,6 +2062,7 @@ static void board_begin(UBYTE code, const UBYTE *body, ULONG got,
         break;
     case CMD_GET:
     case CMD_LIST:
+    case CMD_AREXX:
         txt = body; n = got;
         break;
     case CMD_PUT:                        /* u16 pathlen + path + data */
@@ -2129,6 +2212,7 @@ static void serve(int sock, const char *client)
         case CMD_UITREE: do_uitree(sock); break;
         case CMD_UIACT: do_uiact(sock, body, len); break;
         case CMD_MENUS: do_menus(sock, body, len); break;
+        case CMD_AREXX: do_arexx(sock, body, len); break;
         case CMD_INPUT: do_input(sock, body, len); break;
         case CMD_BREAK: do_break(sock); break;
         default:       send_err(sock, "unknown command"); break;

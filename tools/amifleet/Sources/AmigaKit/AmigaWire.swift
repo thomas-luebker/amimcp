@@ -82,6 +82,7 @@ public struct AmigaClient: Sendable {
     static let cmdUIAct: UInt8 = 0x0E
     static let cmdMenus: UInt8 = 0x0F
     static let cmdAuth: UInt8 = 0x10
+    static let cmdArexx: UInt8 = 0x12
 
     // ---- one transaction -------------------------------------------------
 
@@ -236,6 +237,17 @@ extension AmigaClient {
             try request(Self.cmdExec, payload, timeout: TimeInterval(deadline) + 15)
         }
         guard body.count >= 4 else { throw AmigaWireError.unreachable("short EXEC reply") }
+        let rc = body.prefix(4).withUnsafeBytes { Int32(bigEndian: $0.load(as: Int32.self)) }
+        return (rc, String(decoding: body.dropFirst(4), as: UTF8.self))
+    }
+
+    /// Run an ARexx program string on the Amiga; returns (rc, RESULT). The
+    /// source IS the program (not a filename), so `address 'DOPUS.1'; 'cmd'`
+    /// drives any ARexx-aware app. Needs ARexx (RexxMast) running.
+    public func arexx(_ source: String, timeout: TimeInterval = 60) async throws -> (Int32, String) {
+        let payload = Data(source.unicodeScalars.map { UInt8($0.value & 0xFF) })
+        let body = try await detached { try request(Self.cmdArexx, payload, timeout: timeout) }
+        guard body.count >= 4 else { throw AmigaWireError.unreachable("short AREXX reply") }
         let rc = body.prefix(4).withUnsafeBytes { Int32(bigEndian: $0.load(as: Int32.self)) }
         return (rc, String(decoding: body.dropFirst(4), as: UTF8.self))
     }
