@@ -29,6 +29,7 @@ CMD_POINTER = 0x0B
 CMD_HASH = 0x0C
 CMD_UITREE = 0x0D
 CMD_UIACT = 0x0E
+CMD_MENUS = 0x0F
 CMD_AUTH = 0x10
 
 # CMD_INPUT ops (see agent/proto.h)
@@ -299,6 +300,43 @@ class Amiga:
     def ui_set(self, gadget: str, text: str, window: str = "") -> str:
         """SPIKE: focus a string gadget by identity, clear it, and type `text`."""
         return self._uiact("settext", gadget, window, text)
+
+    def menus(self, window: str = "") -> str:
+        """SPIKE: a window's menu strip as text (default: the active window).
+
+        Lines: 'W "title"', 'M m enabled "name"', and per item
+        'I m i s code flags "key" "text"' where `key` is the keyboard shortcut
+        and `code` the packed FULLMENUNUM. Standard Intuition menus only.
+        """
+        payload = window.encode("latin-1", "replace")
+        return self._request(CMD_MENUS, payload).decode("latin-1", "replace")
+
+    def menu_key(self, shortcut: str) -> str:
+        """SPIKE: invoke a menu item by its keyboard shortcut char (right-Amiga+char)."""
+        return self._uiact("menushort", shortcut[:1])
+
+    def menu_select(self, item: str, window: str = "") -> str:
+        """SPIKE: invoke a menu item by label. Reads the menu strip, finds the
+        item whose text contains `item`, and triggers its keyboard shortcut.
+
+        Raises AmigaError if there is no match, or the match has no shortcut
+        (menu items without a Command key can't be invoked this way yet).
+        """
+        needle = item.lower()
+        for line in self.menus(window).splitlines():
+            if not line.startswith("I "):
+                continue
+            # I m i s code flags "key" "text"
+            try:
+                key = line.split('"')[1]
+                text = line.split('"')[3]
+            except IndexError:
+                continue
+            if needle in text.lower():
+                if not key:
+                    raise AmigaError(f"menu item {text!r} has no keyboard shortcut")
+                return self.menu_key(key)
+        raise AmigaError(f"no menu item matching {item!r}")
 
     # -- input injection --------------------------------------------------
 

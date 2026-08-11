@@ -42,7 +42,16 @@
                          * GadgetID or label substring. The agent resolves the
                          * gadget to its click centre (same walk as CMD_UITREE)
                          * and drives the click through the input path. Reply is
-                         * a short text summary, or ST_ERR if nothing matched. */
+                         * a short text summary, or ST_ERR if nothing matched.
+                         * The verb "menushort" is special: no gadget - the
+                         * gadget field carries a menu item's shortcut char,
+                         * delivered as right-Amiga+char to the active window. */
+#define CMD_MENUS 0x0F  /* Enumerate a window's menu strip (the menu-bar analogue
+                         * of CMD_UITREE). Payload is an optional window selector
+                         * (title substring or index; empty = active window).
+                         * Reply is line-based text: W/M/I records with each
+                         * item's packed FULLMENUNUM selector, flags, and its
+                         * keyboard shortcut char (invoke via UIACT menushort). */
 #define CMD_AUTH 0x10
 #define CMD_HELLO 0x11  /* client announces what is driving it, as text. Purely
                          * informational and unverifiable - the agent stores it

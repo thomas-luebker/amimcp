@@ -433,6 +433,43 @@ TOOLS = [
             "required": ["gadget"],
         },
     },
+    {
+        "name": "amiga_menus",
+        "description": (
+            "Enumerate a window's menu strip (File/Edit/... and their items) as "
+            "text — the menu-bar complement to amiga_ui_tree. Each item line "
+            "carries its keyboard shortcut and a packed selector; checkmarks and "
+            "disabled state are shown. Default is the active window; pass a "
+            "window title substring or index to pick another. Standard Intuition "
+            "menus only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "window": {"type": "string", "description":
+                    "Optional: window title substring or index (default: active window)."},
+            },
+        },
+    },
+    {
+        "name": "amiga_menu_select",
+        "description": (
+            "Invoke a menu item by name. Reads the menu strip, finds the item "
+            "whose text contains your string, and triggers its keyboard shortcut "
+            "(right-Amiga+key). Errors if there is no match, or the item has no "
+            "shortcut. Read the menus first with amiga_menus."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item": {"type": "string", "description":
+                    "Substring of the menu item's text, e.g. 'Quit' or 'Execute'."},
+                "window": {"type": "string", "description":
+                    "Optional: window title substring or index to scope the menu strip."},
+            },
+            "required": ["item"],
+        },
+    },
 ]
 
 
@@ -625,6 +662,16 @@ def tool_ui_click(ami: Amiga, args: dict) -> list[dict]:
     return [{"type": "text", "text": result}]
 
 
+def tool_menus(ami: Amiga, args: dict) -> list[dict]:
+    text = ami.menus(args.get("window", "")).rstrip("\n")
+    return [{"type": "text", "text": text or "The window has no menu strip."}]
+
+
+def tool_menu_select(ami: Amiga, args: dict) -> list[dict]:
+    result = ami.menu_select(args["item"], window=args.get("window", ""))
+    return [{"type": "text", "text": result}]
+
+
 def _qualifier_bits(names) -> int:
     bits = 0
     for n in names or []:
@@ -771,6 +818,8 @@ HANDLERS = {
     "amiga_system_info": tool_system_info,
     "amiga_ui_tree": tool_ui_tree,
     "amiga_ui_click": tool_ui_click,
+    "amiga_menus": tool_menus,
+    "amiga_menu_select": tool_menu_select,
 }
 
 

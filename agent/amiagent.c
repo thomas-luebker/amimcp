@@ -1583,6 +1583,28 @@ static void input_char(UBYTE ch)
     input_post(&ie);
 }
 
+/* Invoke a menu item by its keyboard shortcut: right-Amiga + the item's
+ * Command char. The keymap gives us the raw code for the character; adding
+ * IEQUALIFIER_RCOMMAND makes Intuition treat it as the menu shortcut for the
+ * active window. Reliable regardless of where the menu box would lay out. */
+static void input_menushort(UBYTE ch)
+{
+    UBYTE rbuf[6];
+    LONG actual;
+    struct InputEvent ie;
+
+    actual = MapANSI((STRPTR)&ch, 1, (STRPTR)rbuf, 3, NULL);
+    if (actual < 1) return;
+
+    ie_init(&ie);
+    ie.ie_Class = IECLASS_RAWKEY;
+    ie.ie_Code = rbuf[0];
+    ie.ie_Qualifier = (UWORD)(rbuf[1] | IEQUALIFIER_RCOMMAND);
+    input_post(&ie);
+    ie.ie_Code = rbuf[0] | IECODE_UP_PREFIX;
+    input_post(&ie);
+}
+
 static int do_input(int sock, const UBYTE *p, ULONG len)
 {
     UBYTE op;
@@ -1771,6 +1793,17 @@ static int do_uiact(int sock, const UBYTE *body, ULONG len)
     if (text) *text++ = '\0';
 
     if (!input_open()) return send_err(sock, "cannot open input.device");
+
+    /* menushort needs no gadget: the "gadget" field carries the item's
+     * shortcut char, delivered as right-Amiga+char to the active window. */
+    if (strcmp(verb, "menushort") == 0) {
+        if (!gsel[0]) return send_err(sock, "menushort: no shortcut char");
+        input_menushort((UBYTE)gsel[0]);
+        sprintf(msg, "menushort '%c'", gsel[0]);
+        say("uiact: %s\n", msg);
+        return send_resp(sock, ST_OK, (UBYTE *)msg, (ULONG)strlen(msg));
+    }
+
     if (!ui_find(win, gsel, &cx, &cy))
         return send_err(sock, "no matching gadget");
 
@@ -1788,12 +1821,120 @@ static int do_uiact(int sock, const UBYTE *body, ULONG len)
         input_key(0x44, 1, 0);                       /* Return: confirm */
         input_key(0x44, 0, 0);
     } else {
-        return send_err(sock, "UIACT verb must be click|dclick|settext");
+        return send_err(sock, "UIACT verb must be click|dclick|settext|menushort");
     }
 
     sprintf(msg, "%s at %d,%d", verb, (int)cx, (int)cy);
     say("uiact: %s\n", msg);
     return send_resp(sock, ST_OK, (UBYTE *)msg, (ULONG)strlen(msg));
+}
+
+/* ------------------------------------------------------------------ *
+ * Menu walker (CMD_MENUS)
+ * ------------------------------------------------------------------ *
+ * The menu-bar analogue of do_uitree: enumerate a window's menu strip so a
+ * client sees File/Edit/... and their items - with the keyboard shortcut and
+ * a packed FULLMENUNUM selector - and can invoke an item by shortcut
+ * (CMD_UIACT verb "menushort"). Payload is an optional window selector (title
+ * substring or index); empty means the active window. Reuses g_uitree as the
+ * reply buffer (one command per connection). Text format:
+ *   W "window title"
+ *   M m enabled "menu name"
+ *   I m i s code flags "key" "item text"   (s = "-" for a top-level item)
+ */
+static struct Window *menu_window(const char *sel)
+{
+    struct Screen *scr;
+    struct Window *w;
+    int wi = 0, wnum;
+    if (!sel || !sel[0]) return IntuitionBase->ActiveWindow;
+    wnum = ui_is_num(sel) ? ui_num(sel) : -1;
+    scr = IntuitionBase->FirstScreen;
+    for (w = scr ? scr->FirstWindow : NULL; w; w = w->NextWindow, wi++) {
+        if (wnum >= 0) { if (wi == wnum) return w; }
+        else if (ui_ci_contains((const char *)w->Title, sel)) return w;
+    }
+    return NULL;
+}
+
+static void menu_label(struct MenuItem *it, char *dst, size_t sz)
+{
+    dst[0] = '\0';
+    if ((it->Flags & ITEMTEXT) && it->ItemFill) {
+        struct IntuiText *t = (struct IntuiText *)it->ItemFill;
+        if (t->IText) ui_san(dst, sz, (const char *)t->IText);
+    }
+}
+
+/* One I-record for a menu item or subitem. sub<0 = top-level item. */
+static ULONG menu_emit(ULONG at, int m, int i, int sub, struct MenuItem *it,
+                       int *trunc)
+{
+    char label[64], key[2], flags[40], line[200];
+    UWORD code = (UWORD)FULLMENUNUM(m, i, (sub < 0 ? NOSUB : sub));
+    int fl = 0;
+
+    menu_label(it, label, sizeof label);
+    key[0] = (it->Flags & COMMSEQ) ? (char)it->Command : '\0';
+    key[1] = '\0';
+
+    flags[0] = '\0';
+    if (!(it->Flags & ITEMENABLED)) { strcat(flags, "disabled"); fl = 1; }
+    if (it->Flags & CHECKIT) { if (fl) strcat(flags, ","); strcat(flags,
+                              (it->Flags & CHECKED) ? "checked" : "uncheck"); fl = 1; }
+    if (it->SubItem) { if (fl) strcat(flags, ","); strcat(flags, "submenu"); fl = 1; }
+    if (!fl) strcpy(flags, "-");
+
+    if (sub < 0)
+        sprintf(line, "I %d %d - %u %s \"%s\" \"%s\"\n",
+                m, i, code, flags, key, label);
+    else
+        sprintf(line, "I %d %d %d %u %s \"%s\" \"%s\"\n",
+                m, i, sub, code, flags, key, label);
+    return ui_put(at, line, trunc);
+}
+
+static int do_menus(int sock, const UBYTE *body, ULONG len)
+{
+    char sel[128], field[64], line[200];
+    struct Window *w;
+    struct Menu *m;
+    ULONG at = 0, n = len < sizeof sel - 1 ? len : sizeof sel - 1;
+    int trunc = 0, mi;
+
+    if (!gfx_ready(sock)) return 0;
+    memcpy(sel, body, n); sel[n] = '\0';
+
+    Forbid();
+    w = menu_window(sel);
+    if (w && w->MenuStrip) {
+        ui_san(field, sizeof field, (const char *)w->Title);
+        sprintf(line, "W \"%s\"\n", field);
+        at = ui_put(at, line, &trunc);
+
+        for (m = w->MenuStrip, mi = 0; m && !trunc; m = m->NextMenu, mi++) {
+            struct MenuItem *it;
+            int ii;
+            ui_san(field, sizeof field, (const char *)m->MenuName);
+            sprintf(line, "M %d %s \"%s\"\n", mi,
+                    (m->Flags & MENUENABLED) ? "on" : "off", field);
+            at = ui_put(at, line, &trunc);
+
+            for (it = m->FirstItem, ii = 0; it && !trunc; it = it->NextItem, ii++) {
+                struct MenuItem *sub;
+                int si;
+                at = menu_emit(at, mi, ii, -1, it, &trunc);
+                for (sub = it->SubItem, si = 0; sub && !trunc;
+                     sub = sub->NextItem, si++)
+                    at = menu_emit(at, mi, ii, si, sub, &trunc);
+            }
+        }
+    }
+    Permit();
+
+    if (trunc) at = ui_put(at, "; truncated\n", &trunc);
+    say("menus: %ld bytes%s\n", (long)at, (w && w->MenuStrip) ? "" : " (no menu strip)");
+    return send_resp(sock, ST_OK, (UBYTE *)g_uitree, at);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1817,6 +1958,7 @@ static const char *cmd_name(UBYTE code)
     case CMD_HASH:    return "HASH";
     case CMD_UITREE:  return "UITREE";
     case CMD_UIACT:   return "UIACT";
+    case CMD_MENUS:   return "MENUS";
     default:          return "?";
     }
 }
@@ -1986,6 +2128,7 @@ static void serve(int sock, const char *client)
         case CMD_POINTER: do_pointer(sock); break;
         case CMD_UITREE: do_uitree(sock); break;
         case CMD_UIACT: do_uiact(sock, body, len); break;
+        case CMD_MENUS: do_menus(sock, body, len); break;
         case CMD_INPUT: do_input(sock, body, len); break;
         case CMD_BREAK: do_break(sock); break;
         default:       send_err(sock, "unknown command"); break;

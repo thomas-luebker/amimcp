@@ -55,6 +55,8 @@ exception: it precedes the real request on the same connection.
 | 0x0B | `POINTER` | *(empty)*                         | `x`, `y`, `screen_w`, `screen_h` (u16 each) |
 | 0x0C | `HASH` | Same as `SHOT`                       | `checksum` (u32) |
 | 0x0D | `UITREE` | *(empty)*                         | Intuition object tree, text |
+| 0x0E | `UIACT` | `verb\twindow\tgadget[\ttext]`      | Short summary, or `ST_ERR` |
+| 0x0F | `MENUS` | window selector (text, optional)    | Menu strip, text |
 | 0x10 | `AUTH` | Shared token, text                   | *(empty)* |
 
 Text payloads are **not** NUL-terminated; the frame length delimits them.
@@ -223,7 +225,7 @@ text payload:
 verb \t window \t gadget [\t text]
 ```
 
-- `verb` — `click`, `dclick`, or `settext`.
+- `verb` — `click`, `dclick`, `settext`, or `menushort`.
 - `window` — a title substring or a window index; empty means any window.
 - `gadget` — a `GadgetID` (numeric) or a case-insensitive substring of the
   gadget's **label or role** (so `close` finds the window's close gadget and
@@ -236,6 +238,29 @@ The agent resolves the match to its click centre using the same walk as
 path. Reply is a short text summary (`click at 50,45`) on success, or `ST_ERR`
 ("no matching gadget") when nothing matched. Same standard-GUI scope as
 `UITREE`.
+
+`menushort` is the exception: it needs no gadget — the `gadget` field carries a
+single menu-item shortcut character, delivered as **right-Amiga + char** to the
+active window (see `MENUS`). This is the reliable way to invoke a menu item; it
+does not depend on menu-box geometry.
+
+## `MENUS` request (spike)
+
+The menu-bar analogue of `UITREE`: enumerate a window's menu strip. The payload
+is an optional window selector (title substring or index); empty means the
+**active** window. Line-based text reply:
+
+```
+W "window title"                          the window these menus belong to
+M m enabled "menu name"                   a menu (enabled: on | off)
+I m i s code flags "key" "item text"      an item (s is - for a top-level item)
+```
+
+`code` is the packed `FULLMENUNUM(menu,item,sub)` selector; `flags` is a
+comma-list of `disabled` / `checked` / `uncheck` / `submenu` (or `-`); `key` is
+the item's keyboard shortcut character if it has one. Invoke an item with
+`UIACT` `menushort` and its `key`. Standard Intuition menus only (walked under
+`Forbid()`); an app with no menu strip yields an empty reply.
 
 ## `SHOT` response
 
