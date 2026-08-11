@@ -16,6 +16,8 @@ final class RFBSession: ObservableObject {
     @Published var image: CGImage?
     @Published var screenSize = CGSize(width: 640, height: 256)
     @Published var statusLine = "…"
+    /// Transient message shown over the screen after a drag-drop transfer.
+    @Published var toast: String?
 
     let machine: Machine
     private var client: RFBClient?
@@ -119,15 +121,69 @@ final class RFBSession: ObservableObject {
                        shouldInterpolate: false, intent: .defaultIntent)
     }
 
-    // ---- input (called from the AppKit layer, main thread) ---------------
+    // ---- drag-drop upload (Mac → Amiga) ----------------------------------
 
-    /// `point` is in Amiga screen pixels; `mask` bit0=left, bit1=middle, bit2=right.
+    /// Files dropped on the screen at Amiga pixel `p`: resolve the Workbench
+    /// drawer under that point (via the UI-tree) and upload each there, falling
+    /// back to RAM: when no drawer is found. The resolved destination is shown.
+    func upload(urls: [URL], atAmigaPoint p: CGPoint) {
+        Task {
+            let dest = await Self.resolveDrawer(at: p, client: machine.client)
+            var done: [String] = []
+            var failedName: String?
+            for url in urls {
+                guard let data = try? Data(contentsOf: url) else { continue }
+                let name = url.lastPathComponent
+                let path = dest.hasSuffix(":") || dest.hasSuffix("/") ? dest + name : "\(dest)/\(name)"
+                do { try await machine.client.putFile(path, data); done.append(name) }
+                catch { failedName = name }
+            }
+            if let failedName {
+                showToast("✗ upload failed: \(failedName)")
+            } else if !done.isEmpty {
+                showToast("↑ \(done.joined(separator: ", ")) → \(dest)")
+            }
+        }
+    }
+
+    func showToast(_ s: String) {
+        toast = s
+        let mine = s
+        Task { try? await Task.sleep(nanoseconds: 3_500_000_000); if self.toast == mine { self.toast = nil } }
+    }
+
+    /// The Workbench drawer under an Amiga point, or "RAM:" as a safe fallback.
+    static func resolveDrawer(at p: CGPoint, client: AmigaClient) async -> String {
+        guard let text = try? await client.uiTree() else { return "RAM:" }
+        let tree = FleetUITree.parse(text)
+        // Among windows under the point, the smallest is the most specific
+        // (avoids picking the full-screen Workbench backdrop over a drawer).
+        let hit = tree.windows
+            .filter { p.x >= CGFloat($0.x) && p.x < CGFloat($0.x + $0.w) &&
+                      p.y >= CGFloat($0.y) && p.y < CGFloat($0.y + $0.h) }
+            .min { $0.w * $0.h < $1.w * $1.h }
+        if let win = hit, let path = drawerPath(fromTitle: win.title) { return path }
+        return "RAM:"
+    }
+
+    /// Best-effort AmigaDOS drawer from a Workbench window title. Sub-drawer
+    /// windows are titled with their full path ("Work:Games"); disk-root windows
+    /// show "Volume  <stats>". Anything else (app windows) → nil → RAM: fallback.
+    static func drawerPath(fromTitle title: String) -> String? {
+        let comps = title.trimmingCharacters(in: .whitespaces).components(separatedBy: "  ")
+        let name = comps[0].trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return nil }
+        if name.contains(":") { return name }          // sub-drawer full path
+        if comps.count > 1 { return name + ":" }        // disk root "Vol  stats"
+        return nil                                       // not a drawer
+    }
 }
 
 struct RFBView: View {
     @EnvironmentObject var fleet: Fleet
     let machine: Machine
     @StateObject private var session: RFBSession
+    @State private var showFiles = false
 
     init(machine: Machine) {
         self.machine = machine
@@ -140,33 +196,54 @@ struct RFBView: View {
                 Text("\(machine.name) — VNC").font(WB.topaz(12)).bold().foregroundColor(.white)
                 Text(session.statusLine).font(WB.topaz(10)).foregroundColor(.white.opacity(0.85))
                 Spacer()
+                Toggle("Files", isOn: $showFiles)
+                    .toggleStyle(.checkbox).font(WB.topaz(11)).foregroundColor(.white)
+                    .help("Browse the Amiga's drives and drag files to the Mac")
                 Circle().fill(session.phase == .streaming ? Color.green : Color.red)
                     .frame(width: 9, height: 9)
             }
             .padding(8)
             .background(WB.blue)
 
-            GeometryReader { geo in
-                let fitted = fittedRect(in: geo.size)
-                ZStack {
-                    WB.darkEdge.opacity(0.6)
-                    switch session.phase {
-                    case .streaming where session.image != nil:
-                        Image(decorative: session.image!, scale: 1)
-                            .resizable()
-                            .interpolation(.none)
-                            .frame(width: fitted.width, height: fitted.height)
-                        RFBInputView(session: session, displayed: fitted, screenSize: session.screenSize)
-                            .frame(width: fitted.width, height: fitted.height)
-                    case .needsInstall:
-                        installPrompt
-                    case .offline(let why):
-                        offlinePrompt(why)
-                    default:
-                        Text(session.statusLine).font(WB.topaz(12)).foregroundColor(.white)
+            HStack(spacing: 0) {
+                GeometryReader { geo in
+                    let fitted = fittedRect(in: geo.size)
+                    ZStack {
+                        WB.darkEdge.opacity(0.6)
+                        switch session.phase {
+                        case .streaming where session.image != nil:
+                            Image(decorative: session.image!, scale: 1)
+                                .resizable()
+                                .interpolation(.none)
+                                .frame(width: fitted.width, height: fitted.height)
+                            RFBInputView(session: session, displayed: fitted, screenSize: session.screenSize)
+                                .frame(width: fitted.width, height: fitted.height)
+                        case .needsInstall:
+                            installPrompt
+                        case .offline(let why):
+                            offlinePrompt(why)
+                        default:
+                            Text(session.statusLine).font(WB.topaz(12)).foregroundColor(.white)
+                        }
+                    }
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .overlay(alignment: .bottom) {
+                        if let toast = session.toast {
+                            Text(toast)
+                                .font(WB.topaz(11)).foregroundColor(.white)
+                                .padding(.horizontal, 12).padding(.vertical, 6)
+                                .background(WB.blue.opacity(0.92))
+                                .overlay(RoundedRectangle(cornerRadius: 4).stroke(WB.darkEdge, lineWidth: 1))
+                                .cornerRadius(4)
+                                .padding(.bottom, 12)
+                                .transition(.opacity)
+                        }
                     }
                 }
-                .frame(width: geo.size.width, height: geo.size.height)
+                if showFiles {
+                    Divider()
+                    FilesPanel(client: machine.client)
+                }
             }
         }
         .background(WB.gray)
@@ -217,6 +294,7 @@ struct RFBInputView: NSViewRepresentable {
     func makeNSView(context: Context) -> Catcher {
         let v = Catcher()
         v.session = session
+        v.registerForDraggedTypes([.fileURL])       // accept files dropped from Finder
         return v
     }
 
@@ -245,16 +323,35 @@ struct RFBInputView: NSViewRepresentable {
             addTrackingArea(t); tracking = t
         }
 
-        private func amigaPoint(_ event: NSEvent) -> CGPoint {
+        private func amigaPointFrom(_ p: CGPoint) -> CGPoint {
             guard displayed.width > 0, screenSize.width > 0 else { return .zero }
-            let p = convert(event.locationInWindow, from: nil)
             let ax = max(0, min(p.x / displayed.width  * screenSize.width,  screenSize.width  - 1))
             let ay = max(0, min(p.y / displayed.height * screenSize.height, screenSize.height - 1))
             return CGPoint(x: ax, y: ay)
         }
 
+        private func amigaPoint(_ event: NSEvent) -> CGPoint {
+            amigaPointFrom(convert(event.locationInWindow, from: nil))
+        }
+
         private func send(_ event: NSEvent) {
             session?.pointer(at: amigaPoint(event), mask: mask)
+        }
+
+        // ---- drag destination: files dropped from the Mac ----------------
+
+        override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
+        override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
+
+        override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+            guard let session else { return false }
+            let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+            guard let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self],
+                                                                   options: opts) as? [URL],
+                  !urls.isEmpty else { return false }
+            let pt = amigaPointFrom(convert(sender.draggingLocation, from: nil))
+            session.upload(urls: urls, atAmigaPoint: pt)
+            return true
         }
 
         override func mouseMoved(with e: NSEvent)   { send(e) }

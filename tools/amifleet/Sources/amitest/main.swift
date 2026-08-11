@@ -141,6 +141,25 @@ Task {
             return
         }
 
+        // xfer mode: exercise LIST / PUT / GET round-trip. Usage:
+        //   amitest <host> [token] xfer [dir]
+        if let idx = args.firstIndex(of: "xfer") {
+            let dir = args.count > idx + 1 ? args[idx + 1] : "SYS:"
+            let entries = try await client.listDir(dir)
+            log("LIST \(dir): \(entries.count) entries")
+            for e in entries.prefix(6) { log("  \(e.isDir ? "D" : "F") \(e.size)\t\(e.name)") }
+            let marker = "amifleet xfer \(Int(Date().timeIntervalSince1970))\n"
+            let payload = Data(marker.utf8)
+            let dest = "RAM:amifleet-xfer.txt"
+            try await client.putFile(dest, payload)
+            log("PUT \(payload.count) bytes → \(dest)")
+            let back = try await client.getFile(dest)
+            log("GET \(dest): \(back.count) bytes — \(back == payload ? "MATCH ✅" : "MISMATCH ❌")")
+            if back != payload { failed = true }
+            _ = try? await client.exec("Delete \(dest) QUIET", deadline: 10)
+            return
+        }
+
         // tree mode: fetch + parse the UITREE through AmigaKit (same path the
         // inspector uses) and print the model.
         if args.contains("tree") {

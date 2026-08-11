@@ -37,6 +37,15 @@ public struct AmigaScreenInfo {
     public let title: String
 }
 
+public struct AmigaDirEntry: Identifiable, Hashable {
+    public var id: String { name }
+    public let isDir: Bool
+    public let size: Int
+    public let protection: String
+    public let date: String
+    public let name: String
+}
+
 /// Amiga raw key codes for the keys that have no printable character
 /// (printable text goes through TEXT, which uses the Amiga's own keymap).
 public let amigaRawkeys: [String: UInt8] = [
@@ -60,6 +69,8 @@ public struct AmigaClient: Sendable {
 
     static let cmdPing: UInt8 = 0x01
     static let cmdExec: UInt8 = 0x02
+    static let cmdGet: UInt8 = 0x03
+    static let cmdPut: UInt8 = 0x04
     static let cmdList: UInt8 = 0x05
     static let cmdInfo: UInt8 = 0x06
     static let cmdShot: UInt8 = 0x07
@@ -253,6 +264,46 @@ extension AmigaClient {
         let body = try await detached { try request(Self.cmdHash) }
         guard body.count >= 4 else { throw AmigaWireError.unreachable("short HASH reply") }
         return body.prefix(4).withUnsafeBytes { UInt32(bigEndian: $0.load(as: UInt32.self)) }
+    }
+
+    // ---- file transfer (GET / PUT / LIST) --------------------------------
+
+    /// A directory listing. `path` is an AmigaDOS dir like `Work:` or `SYS:Tools`.
+    public func listDir(_ path: String) async throws -> [AmigaDirEntry] {
+        let body = try await detached { try request(Self.cmdList, Data(path.unicodeScalars.map { UInt8($0.value & 0xFF) })) }
+        var out: [AmigaDirEntry] = []
+        for line in String(decoding: body, as: UTF8.self).split(separator: "\n") {
+            // type <TAB> size <TAB> protection <TAB> date <TAB> name  (name last:
+            // AmigaDOS names may contain spaces but never tabs).
+            let parts = line.split(separator: "\t", maxSplits: 4, omittingEmptySubsequences: false)
+            guard parts.count == 5 else { continue }
+            out.append(AmigaDirEntry(isDir: parts[0] == "D",
+                                     size: Int(parts[1]) ?? 0,
+                                     protection: String(parts[2]),
+                                     date: String(parts[3]),
+                                     name: String(parts[4])))
+        }
+        out.sort { ($0.isDir ? 0 : 1, $0.name.lowercased()) < ($1.isDir ? 0 : 1, $1.name.lowercased()) }
+        return out
+    }
+
+    /// Download a file's raw bytes.
+    public func getFile(_ path: String, timeout: TimeInterval = 120) async throws -> Data {
+        try await detached {
+            try request(Self.cmdGet, Data(path.unicodeScalars.map { UInt8($0.value & 0xFF) }), timeout: timeout)
+        }
+    }
+
+    /// Upload raw bytes to `path` (creating/overwriting the file).
+    public func putFile(_ path: String, _ data: Data, timeout: TimeInterval = 120) async throws {
+        let pathBytes = Data(path.unicodeScalars.map { UInt8($0.value & 0xFF) })
+        var built = Data()
+        var len = UInt16(pathBytes.count).bigEndian
+        withUnsafeBytes(of: &len) { built.append(contentsOf: $0) }
+        built.append(pathBytes)
+        built.append(data)
+        let payload = built
+        _ = try await detached { try request(Self.cmdPut, payload, timeout: timeout) }
     }
 
     // ---- semantic GUI layer (UITREE / UIACT / MENUS) ---------------------
