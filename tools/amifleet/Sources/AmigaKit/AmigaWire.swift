@@ -86,8 +86,28 @@ public struct AmigaClient: Sendable {
 
     // ---- one transaction -------------------------------------------------
 
+    /// The agent's TLS listener defaults to the plain port + 1.
+    private var tlsPort: UInt16 { port &+ 1 }
+
+    /// Which transport a host resolved to: true = TLS, false = plain, nil = not
+    /// yet contacted. For diagnostics/tests.
+    public static func tlsStatus(host: String) -> Bool? { TLSAvailability.status(host) }
+
     public func request(_ code: UInt8, _ payload: Data = Data(),
                  timeout: TimeInterval = 10) throws -> Data {
+        // Prefer TLS when the machine offers it; remember per host so a
+        // plain-only agent isn't probed on the TLS port every time. A TLS
+        // transport failure falls back to plain; a real agent error (refused /
+        // auth) inside a working tunnel propagates unchanged.
+        if TLSAvailability.shouldTry(host) {
+            do {
+                let r = try requestTLS(code, payload, timeout: timeout)
+                TLSAvailability.record(host, works: true)
+                return r
+            } catch is TLSError {
+                TLSAvailability.record(host, works: false)
+            }
+        }
         let fd = try connect(timeout: timeout)
         defer { close(fd) }
         applyIOTimeout(fd, timeout)
@@ -97,6 +117,51 @@ public struct AmigaClient: Sendable {
         }
         try sendFrame(fd, code, payload)
         return try readResponse(fd)
+    }
+
+    /// One request/response over TLS (Network.framework). Throws `TLSError` when
+    /// the encrypted transport itself is unavailable (so the caller falls back).
+    private func requestTLS(_ code: UInt8, _ payload: Data, timeout: TimeInterval) throws -> Data {
+        let t = TLSTransport(host: host, port: tlsPort)
+        defer { t.close() }
+        try t.open(timeout: timeout)
+        if !token.isEmpty {
+            try t.send(Self.buildFrame(Self.cmdAuth, Data(token.utf8)))
+            _ = try Self.parseResponse { try t.recvExact($0) }
+        }
+        try t.send(Self.buildFrame(code, payload))
+        return try Self.parseResponse { try t.recvExact($0) }
+    }
+
+    /// Build a wire frame — shared by the plain and TLS paths.
+    static func buildFrame(_ code: UInt8, _ payload: Data) -> Data {
+        var frame = Data("AMI0".utf8)
+        frame.append(contentsOf: [code, 0, 0, 0])
+        var len = UInt32(payload.count).bigEndian
+        withUnsafeBytes(of: &len) { frame.append(contentsOf: $0) }
+        frame.append(payload)
+        return frame
+    }
+
+    /// Parse a response given a byte reader — shared by the plain and TLS paths.
+    static func parseResponse(_ recv: (Int) throws -> Data) throws -> Data {
+        let header = try recv(12)
+        guard header.prefix(4) == Data("AMI0".utf8) else {
+            throw AmigaWireError.unreachable("bad magic in response")
+        }
+        let status = header[header.startIndex + 4]
+        let length = header.subdata(in: header.startIndex + 8 ..< header.startIndex + 12)
+            .withUnsafeBytes { UInt32(bigEndian: $0.load(as: UInt32.self)) }
+        guard length <= 16 * 1024 * 1024 else {
+            throw AmigaWireError.unreachable("response claims \(length) bytes")
+        }
+        let body = try recv(Int(length))
+        switch status {
+        case 0x00: return body
+        case 0x01: throw AmigaWireError.refused(String(decoding: body, as: UTF8.self))
+        case 0x02: throw AmigaWireError.authRequired
+        default: throw AmigaWireError.unreachable("unknown status \(status)")
+        }
     }
 
     // ---- framing ---------------------------------------------------------

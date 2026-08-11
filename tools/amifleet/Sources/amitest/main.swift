@@ -127,6 +127,41 @@ Task {
             return
         }
 
+        // rfbclick mode: click once at x,y (recovery helper). Usage:
+        //   amitest <host> [token] rfbclick <x> <y> [pw] [port]
+        if let idx = args.firstIndex(of: "rfbclick"), args.count > idx + 2 {
+            let cx = Int(args[idx + 1]) ?? 0, cy = Int(args[idx + 2]) ?? 0
+            let pw = args.count > idx + 3 ? args[idx + 3] : "amiga"
+            let port = args.count > idx + 4 ? (UInt16(args[idx + 4]) ?? 5900) : 5900
+            let rfb = RFBClient(host: host, port: port)
+            try rfb.handshake(password: pw)
+            try rfb.requestUpdate(incremental: false); _ = try rfb.pumpOnce(timeout: 2)
+            try rfb.sendPointer(x: cx, y: cy, buttonMask: 0); usleep(120_000)
+            try rfb.sendPointer(x: cx, y: cy, buttonMask: 1); usleep(60_000)
+            try rfb.sendPointer(x: cx, y: cy, buttonMask: 0)
+            usleep(300_000)
+            rfb.close()
+            log("clicked (\(cx),\(cy))")
+            return
+        }
+
+        // tls mode: exercise the auto-TLS-with-fallback wire path against a
+        // given plain port (its TLS listener is port+1). Usage:
+        //   amitest <host> [token] tls [port]
+        if let idx = args.firstIndex(of: "tls") {
+            let p = args.count > idx + 1 ? (UInt16(args[idx + 1]) ?? 7846) : 7846
+            let c = AmigaClient(host: host, port: p, token: token)
+            log("ping: \(try await c.ping())")
+            let (rc, res) = try await c.arexx("return 6*7")
+            log("arexx over the chosen transport: rc=\(rc) result=\(res)")
+            switch AmigaClient.tlsStatus(host: host) {
+            case .some(true):  log("transport: TLS ✅ (encrypted, cert pinned)")
+            case .some(false): log("transport: plain (no TLS on \(p + 1))")
+            case .none:        log("transport: unknown")
+            }
+            return
+        }
+
         // rfbfmt mode: connect, print ONLY the server's pixel format, and close.
         // No frame is pulled or saved — a screen-content-free diagnostic for the
         // "wrong colours on some RTG modes" bug. Usage:
