@@ -37,7 +37,7 @@ public struct AmigaScreenInfo {
     public let title: String
 }
 
-public struct AmigaDirEntry: Identifiable, Hashable {
+public struct AmigaDirEntry: Identifiable, Hashable, Sendable {
     public var id: String { name }
     public let isDir: Bool
     public let size: Int
@@ -292,6 +292,36 @@ extension AmigaClient {
         try await detached {
             try request(Self.cmdGet, Data(path.unicodeScalars.map { UInt8($0.value & 0xFF) }), timeout: timeout)
         }
+    }
+
+    /// The agent's per-frame ceiling (AMI_MAXFRAME). GET/PUT can't exceed it in
+    /// one shot, so larger files are chunked.
+    public static let maxFrame = 16 * 1024 * 1024
+
+    /// Upload of any size: a small file goes in one PUT; a large one is split
+    /// into ≤ `chunk` parts, each PUT, then reassembled on the Amiga with `Join`.
+    /// `progress` is called with 0…1 as parts land.
+    public func sendFile(_ path: String, _ data: Data, chunk: Int = 8 * 1024 * 1024,
+                         progress: (@Sendable (Double) -> Void)? = nil) async throws {
+        if data.count <= chunk {
+            try await putFile(path, data, timeout: 300)
+            progress?(1)
+            return
+        }
+        let n = (data.count + chunk - 1) / chunk
+        var parts: [String] = []
+        for i in 0..<n {
+            let lo = i * chunk, hi = min(lo + chunk, data.count)
+            let part = "\(path).ap\(i)"
+            try await putFile(part, data.subdata(in: lo..<hi), timeout: 300)
+            parts.append(part)
+            progress?(Double(i + 1) / Double(n + 1))       // leave a slice for Join
+        }
+        let quoted = parts.map { "\"\($0)\"" }.joined(separator: " ")
+        let (rc, out) = try await exec("Join \(quoted) AS \"\(path)\"", deadline: 180)
+        _ = try? await exec("Delete \(quoted) QUIET", deadline: 120)
+        guard rc == 0 else { throw AmigaWireError.refused("Join failed (rc \(rc)): \(out)") }
+        progress?(1)
     }
 
     /// Upload raw bytes to `path` (creating/overwriting the file).

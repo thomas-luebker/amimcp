@@ -5,6 +5,7 @@
 
 import SwiftUI
 import CoreGraphics
+import AppKit
 import AmigaKit
 
 @MainActor
@@ -18,6 +19,8 @@ final class RFBSession: ObservableObject {
     @Published var statusLine = "…"
     /// Transient message shown over the screen after a drag-drop transfer.
     @Published var toast: String?
+    /// Where a file being dragged over the screen would land ("→ Work:Games").
+    @Published var dropTarget: String?
 
     let machine: Machine
     private var client: RFBClient?
@@ -131,12 +134,22 @@ final class RFBSession: ObservableObject {
             let dest = await Self.resolveDrawer(at: p, client: machine.client)
             var done: [String] = []
             var failedName: String?
-            for url in urls {
+            for (i, url) in urls.enumerated() {
                 guard let data = try? Data(contentsOf: url) else { continue }
                 let name = url.lastPathComponent
                 let path = dest.hasSuffix(":") || dest.hasSuffix("/") ? dest + name : "\(dest)/\(name)"
-                do { try await machine.client.putFile(path, data); done.append(name) }
-                catch { failedName = name }
+                let tag = urls.count > 1 ? "[\(i + 1)/\(urls.count)] " : ""
+                let showPct = data.count > AmigaClient.maxFrame       // only big files chunk
+                toast = "↑ \(tag)\(name) → \(dest)…"
+                do {
+                    try await machine.client.sendFile(path, data) { frac in
+                        Task { @MainActor in
+                            self.toast = showPct ? "↑ \(tag)\(name) → \(dest)  \(Int(frac * 100))%"
+                                                 : "↑ \(tag)\(name) → \(dest)…"
+                        }
+                    }
+                    done.append(name)
+                } catch { failedName = name }
             }
             if let failedName {
                 showToast("✗ upload failed: \(failedName)")
@@ -155,16 +168,39 @@ final class RFBSession: ObservableObject {
     /// The Workbench drawer under an Amiga point, or "RAM:" as a safe fallback.
     static func resolveDrawer(at p: CGPoint, client: AmigaClient) async -> String {
         guard let text = try? await client.uiTree() else { return "RAM:" }
-        let tree = FleetUITree.parse(text)
-        // Among windows under the point, the smallest is the most specific
-        // (avoids picking the full-screen Workbench backdrop over a drawer).
-        let hit = tree.windows
+        return drawer(in: FleetUITree.parse(text).windows, at: p)
+    }
+
+    /// Among windows under the point, the smallest is the most specific (avoids
+    /// picking the full-screen Workbench backdrop over a drawer).
+    static func drawer(in windows: [FleetUIWindow], at p: CGPoint) -> String {
+        let hit = windows
             .filter { p.x >= CGFloat($0.x) && p.x < CGFloat($0.x + $0.w) &&
                       p.y >= CGFloat($0.y) && p.y < CGFloat($0.y + $0.h) }
             .min { $0.w * $0.h < $1.w * $1.h }
         if let win = hit, let path = drawerPath(fromTitle: win.title) { return path }
         return "RAM:"
     }
+
+    // ---- live drop target (while a file is dragged over the screen) -------
+
+    private var hoverWindows: [FleetUIWindow] = []
+
+    /// Fetch the window layout once when a drag enters, so hover updates are local.
+    func dropHoverBegin() {
+        dropTarget = "…"
+        Task {
+            if let text = try? await machine.client.uiTree() {
+                hoverWindows = FleetUITree.parse(text).windows
+            }
+        }
+    }
+
+    func dropHoverMove(at p: CGPoint) {
+        dropTarget = "→ " + Self.drawer(in: hoverWindows, at: p)
+    }
+
+    func dropHoverEnd() { dropTarget = nil; hoverWindows = [] }
 
     /// Best-effort AmigaDOS drawer from a Workbench window title. Sub-drawer
     /// windows are titled with their full path ("Work:Games"); disk-root windows
@@ -184,6 +220,9 @@ struct RFBView: View {
     let machine: Machine
     @StateObject private var session: RFBSession
     @State private var showFiles = false
+    @State private var scaleMode: ScaleMode = .fit
+
+    enum ScaleMode { case fit, actual }
 
     init(machine: Machine) {
         self.machine = machine
@@ -196,6 +235,13 @@ struct RFBView: View {
                 Text("\(machine.name) — VNC").font(WB.topaz(12)).bold().foregroundColor(.white)
                 Text(session.statusLine).font(WB.topaz(10)).foregroundColor(.white.opacity(0.85))
                 Spacer()
+                Picker("", selection: $scaleMode) {
+                    Text("Fit").tag(ScaleMode.fit)
+                    Text("1×").tag(ScaleMode.actual)
+                }
+                .pickerStyle(.segmented).labelsHidden().frame(width: 84)
+                Button("⛶") { NSApplication.shared.keyWindow?.toggleFullScreen(nil) }
+                    .buttonStyle(WBButtonStyle()).help("Full screen")
                 Toggle("Files", isOn: $showFiles)
                     .toggleStyle(.checkbox).font(WB.topaz(11)).foregroundColor(.white)
                     .help("Browse the Amiga's drives and drag files to the Mac")
@@ -207,38 +253,9 @@ struct RFBView: View {
 
             HStack(spacing: 0) {
                 GeometryReader { geo in
-                    let fitted = fittedRect(in: geo.size)
-                    ZStack {
-                        WB.darkEdge.opacity(0.6)
-                        switch session.phase {
-                        case .streaming where session.image != nil:
-                            Image(decorative: session.image!, scale: 1)
-                                .resizable()
-                                .interpolation(.none)
-                                .frame(width: fitted.width, height: fitted.height)
-                            RFBInputView(session: session, displayed: fitted, screenSize: session.screenSize)
-                                .frame(width: fitted.width, height: fitted.height)
-                        case .needsInstall:
-                            installPrompt
-                        case .offline(let why):
-                            offlinePrompt(why)
-                        default:
-                            Text(session.statusLine).font(WB.topaz(12)).foregroundColor(.white)
-                        }
-                    }
-                    .frame(width: geo.size.width, height: geo.size.height)
-                    .overlay(alignment: .bottom) {
-                        if let toast = session.toast {
-                            Text(toast)
-                                .font(WB.topaz(11)).foregroundColor(.white)
-                                .padding(.horizontal, 12).padding(.vertical, 6)
-                                .background(WB.blue.opacity(0.92))
-                                .overlay(RoundedRectangle(cornerRadius: 4).stroke(WB.darkEdge, lineWidth: 1))
-                                .cornerRadius(4)
-                                .padding(.bottom, 12)
-                                .transition(.opacity)
-                        }
-                    }
+                    screenArea(geo)
+                        .overlay(alignment: .bottom) { toastOverlay }
+                        .overlay(alignment: .top) { dropOverlay }
                 }
                 if showFiles {
                     Divider()
@@ -250,6 +267,61 @@ struct RFBView: View {
         .navigationTitle("\(machine.name) — VNC")
         .onAppear { session.start() }
         .onDisappear { session.stop() }
+    }
+
+    @ViewBuilder private func screenArea(_ geo: GeometryProxy) -> some View {
+        if scaleMode == .actual, session.phase == .streaming, session.image != nil {
+            ScrollView([.horizontal, .vertical]) {
+                screenContent(displayed: session.screenSize)
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
+        } else {
+            screenContent(displayed: fittedRect(in: geo.size))
+                .frame(width: geo.size.width, height: geo.size.height)
+        }
+    }
+
+    @ViewBuilder private func screenContent(displayed: CGSize) -> some View {
+        ZStack {
+            WB.darkEdge.opacity(0.6)
+            switch session.phase {
+            case .streaming where session.image != nil:
+                Image(decorative: session.image!, scale: 1)
+                    .resizable().interpolation(.none)
+                    .frame(width: displayed.width, height: displayed.height)
+                RFBInputView(session: session, displayed: displayed, screenSize: session.screenSize)
+                    .frame(width: displayed.width, height: displayed.height)
+            case .needsInstall:
+                installPrompt
+            case .offline(let why):
+                offlinePrompt(why)
+            default:
+                Text(session.statusLine).font(WB.topaz(12)).foregroundColor(.white)
+            }
+        }
+    }
+
+    @ViewBuilder private var toastOverlay: some View {
+        if let toast = session.toast {
+            Text(toast)
+                .font(WB.topaz(11)).foregroundColor(.white)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(WB.blue.opacity(0.92))
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(WB.darkEdge, lineWidth: 1))
+                .cornerRadius(4).padding(.bottom, 12)
+                .transition(.opacity)
+        }
+    }
+
+    @ViewBuilder private var dropOverlay: some View {
+        if let target = session.dropTarget {
+            Text("Drop \(target)")
+                .font(WB.topaz(12)).bold().foregroundColor(.white)
+                .padding(.horizontal, 14).padding(.vertical, 7)
+                .background(WB.amber.opacity(0.95))
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(WB.darkEdge, lineWidth: 1))
+                .cornerRadius(4).padding(.top, 12)
+        }
     }
 
     private var installPrompt: some View {
@@ -340,11 +412,20 @@ struct RFBInputView: NSViewRepresentable {
 
         // ---- drag destination: files dropped from the Mac ----------------
 
-        override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
-        override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
+        override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+            session?.dropHoverBegin()
+            session?.dropHoverMove(at: amigaPointFrom(convert(sender.draggingLocation, from: nil)))
+            return .copy
+        }
+        override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+            session?.dropHoverMove(at: amigaPointFrom(convert(sender.draggingLocation, from: nil)))
+            return .copy
+        }
+        override func draggingExited(_ sender: NSDraggingInfo?) { session?.dropHoverEnd() }
 
         override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
             guard let session else { return false }
+            session.dropHoverEnd()
             let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
             guard let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self],
                                                                    options: opts) as? [URL],

@@ -160,6 +160,43 @@ Task {
             return
         }
 
+        // bigput mode: chunked upload of a >16 MB file (split → PUT → Join).
+        //   amitest <host> [token] bigput [MB]
+        if let idx = args.firstIndex(of: "bigput") {
+            let mb = args.count > idx + 1 ? (Int(args[idx + 1]) ?? 18) : 18
+            var data = Data(count: mb * 1024 * 1024)
+            for i in stride(from: 0, to: data.count, by: 4096) { data[i] = UInt8(i & 0xFF) }
+            let payload = data
+            let dest = "RAM:amifleet-big.bin"
+            log("sendFile \(mb) MB → \(dest) (chunked)")
+            try await client.sendFile(dest, payload) { f in print("[\(host)]   \(Int(f * 100))%") }
+            let entries = try await client.listDir("RAM:")
+            if let e = entries.first(where: { $0.name == "amifleet-big.bin" }) {
+                log("on Amiga: \(e.size) bytes — \(e.size == payload.count ? "MATCH ✅" : "MISMATCH ❌ want \(payload.count)")")
+                if e.size != payload.count { failed = true }
+            } else { log("file missing after upload ❌"); failed = true }
+            _ = try? await client.exec("Delete \(dest) QUIET", deadline: 10)
+            return
+        }
+
+        // clip mode: does AmiVNC speak RFB clipboard? Send ClientCutText, then
+        // watch for any ServerCutText. Usage: amitest <host> [token] clip [pw] [port]
+        if let idx = args.firstIndex(of: "clip") {
+            let pw = args.count > idx + 1 ? args[idx + 1] : "amiga"
+            let port = args.count > idx + 2 ? (UInt16(args[idx + 2]) ?? 5900) : 5900
+            let rfb = RFBClient(host: host, port: port)
+            rfb.onServerCut = { text in print("[\(host)] SERVER CUT TEXT ⇐ \(text.prefix(80))") }
+            try rfb.handshake(password: pw)
+            log("connected \(rfb.width)×\(rfb.height); sending ClientCutText…")
+            try rfb.sendCutText("amifleet-clipboard-test")
+            log("ClientCutText sent OK (AmiVNC accepted msg 6)")
+            try rfb.requestUpdate(incremental: false)
+            for _ in 0..<10 { _ = try rfb.pumpOnce(timeout: 0.5) }
+            log("done — if no SERVER CUT TEXT above, AmiVNC doesn't push its clipboard")
+            rfb.close()
+            return
+        }
+
         // tree mode: fetch + parse the UITREE through AmigaKit (same path the
         // inspector uses) and print the model.
         if args.contains("tree") {

@@ -186,7 +186,7 @@ public final class RFBClient: @unchecked Sendable {
         case 0: return try readFramebufferUpdate()
         case 1: try readColourMap(); return nil
         case 2: return nil                            // Bell
-        case 3: try skipCutText(); return nil
+        case 3: try readServerCutText(); return nil
         default: throw RFBError.proto("unknown server message \(msgType)")
         }
     }
@@ -308,10 +308,18 @@ public final class RFBClient: @unchecked Sendable {
         }
     }
 
-    private func skipCutText() throws {
+    /// The server pushed clipboard text (ServerCutText) — hand it to the host so
+    /// it can land on the Mac pasteboard. Called from the pump thread.
+    public var onServerCut: (@Sendable (String) -> Void)?
+
+    private func readServerCutText() throws {
         _ = try recvExact(3)                          // padding
         let len = Int(try recvU32())
-        if len > 0 { _ = try recvExact(min(len, 1 << 20)) }
+        guard len > 0 else { return }
+        let raw = try recvExact(min(len, 1 << 20))
+        // RFB cut text is Latin-1.
+        let text = String(raw.map { Character(UnicodeScalar($0)) })
+        onServerCut?(text)
     }
 
     // ---- input -----------------------------------------------------------
@@ -329,6 +337,16 @@ public final class RFBClient: @unchecked Sendable {
         var msg = Data([4, down ? 1 : 0, 0, 0])
         let k = keysym.bigEndian
         withUnsafeBytes(of: k) { msg.append(contentsOf: $0) }
+        try writeAll(msg)
+    }
+
+    /// Push the Mac's clipboard text to the Amiga (ClientCutText, RFB msg 6).
+    public func sendCutText(_ text: String) throws {
+        let bytes = text.unicodeScalars.map { UInt8($0.value & 0xFF) }
+        var msg = Data([6, 0, 0, 0])                  // type + 3 pad
+        var len = UInt32(bytes.count).bigEndian
+        withUnsafeBytes(of: &len) { msg.append(contentsOf: $0) }
+        msg.append(contentsOf: bytes)
         try writeAll(msg)
     }
 

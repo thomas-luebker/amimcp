@@ -77,6 +77,10 @@ final class FilesModel: ObservableObject {
 
     /// Save-panel fallback (and the obvious button for people who don't drag).
     func save(_ e: AmigaDirEntry) {
+        guard e.size <= AmigaClient.maxFrame else {
+            status = "\(e.name) is over 16 MB — download of large files isn’t supported yet"
+            return
+        }
         let full = Self.join(path, e.name)
         let panel = NSSavePanel()
         panel.nameFieldStringValue = e.name
