@@ -67,6 +67,9 @@ public struct AmigaClient: Sendable {
     static let cmdScreens: UInt8 = 0x0A
     static let cmdPointer: UInt8 = 0x0B
     static let cmdHash: UInt8 = 0x0C
+    static let cmdUITree: UInt8 = 0x0D
+    static let cmdUIAct: UInt8 = 0x0E
+    static let cmdMenus: UInt8 = 0x0F
     static let cmdAuth: UInt8 = 0x10
 
     // ---- one transaction -------------------------------------------------
@@ -250,6 +253,40 @@ extension AmigaClient {
         let body = try await detached { try request(Self.cmdHash) }
         guard body.count >= 4 else { throw AmigaWireError.unreachable("short HASH reply") }
         return body.prefix(4).withUnsafeBytes { UInt32(bigEndian: $0.load(as: UInt32.self)) }
+    }
+
+    // ---- semantic GUI layer (UITREE / UIACT / MENUS) ---------------------
+
+    /// The frontmost screen's Intuition window/gadget tree, as text (see
+    /// PROTOCOL.md UITREE). Parse with `FleetUINode.parse`.
+    public func uiTree() async throws -> String {
+        let body = try await detached { try request(Self.cmdUITree) }
+        return String(decoding: body, as: UTF8.self)
+    }
+
+    /// Click a gadget by identity: `gadget` is a GadgetID or a label/role
+    /// substring, `window` optionally scopes by title/index. Returns the
+    /// agent's short summary; throws `.refused` if nothing matched.
+    @discardableResult
+    public func uiClick(gadget: String, window: String = "", double: Bool = false) async throws -> String {
+        let payload = "\(double ? "dclick" : "click")\t\(window)\t\(gadget)"
+        let body = try await detached { try request(Self.cmdUIAct, Data(payload.utf8)) }
+        return String(decoding: body, as: UTF8.self)
+    }
+
+    /// A window's menu strip as text (default: the active window). See
+    /// PROTOCOL.md MENUS.
+    public func menus(window: String = "") async throws -> String {
+        let body = try await detached { try request(Self.cmdMenus, Data(window.utf8)) }
+        return String(decoding: body, as: UTF8.self)
+    }
+
+    /// Invoke a menu item by its shortcut character (right-Amiga+char).
+    @discardableResult
+    public func menuShortcut(_ char: Character) async throws -> String {
+        let payload = "menushort\t\t\(char)"
+        let body = try await detached { try request(Self.cmdUIAct, Data(payload.utf8)) }
+        return String(decoding: body, as: UTF8.self)
     }
 
     public func screenshot(timeout: TimeInterval = 60) async throws -> AmigaScreenshot {

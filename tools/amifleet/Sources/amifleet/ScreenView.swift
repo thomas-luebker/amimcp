@@ -35,6 +35,9 @@ final class ScreenSession: ObservableObject {
 
     func stop() { loop?.cancel(); loop = nil }
 
+    /// Force the next heartbeat to pull a fresh frame (after an inspector action).
+    func forceRefresh() { lastHash = nil }
+
     private func run() async {
         await fetchFrame()
         while !Task.isCancelled {
@@ -104,6 +107,7 @@ struct ScreenView: View {
     @EnvironmentObject var fleet: Fleet
     let machine: Machine
     @StateObject private var session: ScreenSession
+    @State private var showInspector = false
 
     init(machine: Machine) {
         self.machine = machine
@@ -116,31 +120,39 @@ struct ScreenView: View {
                 Text("\(machine.name) — live").font(WB.topaz(12)).bold().foregroundColor(.white)
                 Text(session.statusLine).font(WB.topaz(10)).foregroundColor(.white.opacity(0.8))
                 Spacer()
+                Toggle("Inspect", isOn: $showInspector)
+                    .toggleStyle(.checkbox).font(WB.topaz(11)).foregroundColor(.white)
                 Toggle("Pause", isOn: $session.paused)
                     .toggleStyle(.checkbox).font(WB.topaz(11)).foregroundColor(.white)
             }
             .padding(8)
             .background(WB.blue)
 
-            GeometryReader { geo in
-                let fitted = fittedRect(in: geo.size)
-                ZStack {
-                    WB.darkEdge.opacity(0.6)
-                    if let cg = session.image {
-                        Image(decorative: cg, scale: 1)
-                            .resizable()
-                            .interpolation(.none)          // chunky pixels, as nature intended
+            HStack(spacing: 0) {
+                GeometryReader { geo in
+                    let fitted = fittedRect(in: geo.size)
+                    ZStack {
+                        WB.darkEdge.opacity(0.6)
+                        if let cg = session.image {
+                            Image(decorative: cg, scale: 1)
+                                .resizable()
+                                .interpolation(.none)      // chunky pixels, as nature intended
+                                .frame(width: fitted.width, height: fitted.height)
+                        } else {
+                            Text("waiting for the first frame…")
+                                .font(WB.topaz(12)).foregroundColor(.white)
+                        }
+                        RemoteInputView(session: session,
+                                        displayed: fitted,
+                                        screenSize: session.screenSize)
                             .frame(width: fitted.width, height: fitted.height)
-                    } else {
-                        Text("waiting for the first frame…")
-                            .font(WB.topaz(12)).foregroundColor(.white)
                     }
-                    RemoteInputView(session: session,
-                                    displayed: fitted,
-                                    screenSize: session.screenSize)
-                        .frame(width: fitted.width, height: fitted.height)
+                    .frame(width: geo.size.width, height: geo.size.height)
                 }
-                .frame(width: geo.size.width, height: geo.size.height)
+                if showInspector {
+                    Divider()
+                    InspectorPanel(client: machine.client) { session.forceRefresh() }
+                }
             }
         }
         .background(WB.gray)

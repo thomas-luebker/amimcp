@@ -48,6 +48,21 @@ Task {
             return
         }
 
+        // tree mode: fetch + parse the UITREE through AmigaKit (same path the
+        // inspector uses) and print the model.
+        if args.contains("tree") {
+            let tree = FleetUITree.parse(try await client.uiTree())
+            log("screen: \(tree.screen), \(tree.windows.count) window(s)")
+            for win in tree.windows {
+                log("  W \(win.displayTitle)\(win.active ? " [active]" : "") "
+                    + "@\(win.x),\(win.y) \(win.w)×\(win.h) — \(win.gadgets.count) gadget(s)")
+                for g in win.gadgets.prefix(12) {
+                    log("    G#\(g.gadgetID) \(g.kind) \"\(g.display)\" -> selector \"\(g.selector)\"")
+                }
+            }
+            return
+        }
+
         log("ping: \(try await client.ping())")
 
         // A shell window at a known, on-screen rectangle so the click lands in it
