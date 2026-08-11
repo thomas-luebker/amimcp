@@ -12,7 +12,10 @@ enum VNCLauncher {
     /// key differs and every login is rejected. Keep this ≤ 7 (verified live:
     /// 8-char fails auth outright, 5-char passes).
     static let password = "amiga"
-    static let port = 5900
+    static let port = 5900          // full colour (native depth)
+    static let fastPort = 5901      // "Fast": AmiVNC -a, BGR233 = 1 byte/pixel
+
+    static func activePort(fast: Bool) -> Int { fast ? fastPort : port }
     /// The .020 build runs on every CPU (040/060/Emu68); performance here is
     /// I/O-bound, so we favour compatibility over an 060-tuned binary.
     static let exe = "SYS:Programs/AmiVNC/AmiVNC.020"
@@ -51,15 +54,18 @@ enum VNCLauncher {
     /// Idempotent: if the server is already up (port in use) the second start
     /// just exits harmlessly.
     @discardableResult
-    static func startServer(_ client: AmigaClient) async -> Result {
+    static func startServer(_ client: AmigaClient, fast: Bool = false) async -> Result {
         // 1. Write the password file (AmiVNC -p… sets it and exits).
         _ = try? await client.exec("\(exe) -p\(password)", deadline: 20)
-        // 2. Start the server detached on our port. The `<NIL:` is load-bearing:
-        //    without a redirected input, AmiVNC's inherited console handle closes
-        //    the moment the launching shell returns and the server exits with it.
-        //    With `<NIL:` it stays up, listening on \(port) and serving the
-        //    frontmost screen. (Verified live on the PiStorm.) `-s` sets the port.
-        _ = try? await client.exec("Run >NIL: <NIL: \(exe) -s\(port)", deadline: 10)
-        return Result(ok: true, message: "AmiVNC is serving :\(port).")
+        // 2. Start the server detached. The `<NIL:` is load-bearing: without a
+        //    redirected input, AmiVNC's inherited console handle closes the moment
+        //    the launching shell returns and the server exits with it. With
+        //    `<NIL:` it stays up, serving the frontmost screen. `-s` sets the
+        //    port; `-a` requests BGR233 (1 byte/pixel) for the low-bandwidth mode.
+        //    Full colour and fast use separate ports because AmiVNC can't be
+        //    stopped remotely to switch flags on one port.
+        let p = activePort(fast: fast)
+        _ = try? await client.exec("Run >NIL: <NIL: \(exe) -s\(p)\(fast ? " -a" : "")", deadline: 10)
+        return Result(ok: true, message: "AmiVNC is serving :\(p).")
     }
 }

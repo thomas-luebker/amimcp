@@ -21,12 +21,23 @@ final class RFBSession: ObservableObject {
     @Published var toast: String?
     /// Where a file being dragged over the screen would land ("→ Work:Games").
     @Published var dropTarget: String?
+    /// Low-bandwidth BGR233 mode (AmiVNC -a): 1 byte/pixel, 4× less data.
+    @Published var fast = false
 
     let machine: Machine
     private var client: RFBClient?
     private var loop: Task<Void, Never>?
 
     init(machine: Machine) { self.machine = machine }
+
+    /// Switch colour depth / bandwidth. Tears down and reconnects on the mode's
+    /// port (full colour and fast live on separate ports).
+    func setFast(_ on: Bool) {
+        guard on != fast, machine.host != "" else { return }
+        fast = on
+        stop()
+        Task { await bringUp() }
+    }
 
     /// Full lifecycle: is AmiVNC installed? → (offer install) → start → stream.
     func start() {
@@ -66,8 +77,8 @@ final class RFBSession: ObservableObject {
 
     private func launchAndStream() async {
         phase = .starting; statusLine = "starting AmiVNC…"
-        await VNCLauncher.startServer(machine.client)
-        let client = RFBClient(host: machine.host, port: UInt16(VNCLauncher.port))
+        await VNCLauncher.startServer(machine.client, fast: fast)
+        let client = RFBClient(host: machine.host, port: UInt16(VNCLauncher.activePort(fast: fast)))
         self.client = client
         loop = Task.detached(priority: .userInitiated) { [weak self] in
             await self?.run(client: client, password: VNCLauncher.password)
@@ -242,6 +253,9 @@ struct RFBView: View {
                 .pickerStyle(.segmented).labelsHidden().frame(width: 84)
                 Button("⛶") { NSApplication.shared.keyWindow?.toggleFullScreen(nil) }
                     .buttonStyle(WBButtonStyle()).help("Full screen")
+                Toggle("Fast", isOn: Binding(get: { session.fast }, set: { session.setFast($0) }))
+                    .toggleStyle(.checkbox).font(WB.topaz(11)).foregroundColor(.white)
+                    .help("Low-bandwidth 256-colour mode (BGR233) — 4× less data, ideal on real 68k")
                 Toggle("Files", isOn: $showFiles)
                     .toggleStyle(.checkbox).font(WB.topaz(11)).foregroundColor(.white)
                     .help("Browse the Amiga's drives and drag files to the Mac")
