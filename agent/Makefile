@@ -22,10 +22,22 @@ ifdef OWNBASES
 CFLAGS += -DAMIAGENT_OWN_LIBBASES
 endif
 
+# Optional TLS via AmiSSL. The AmiSSL SDK is an external build dependency (like
+# the toolchain) — it is not vendored (its OpenSSL headers are ~11 MB). Point
+# AMISSL_SDK at the extracted "AmiSSL/Developer" dir:
+#   make SSL=1 AMISSL_SDK=/path/to/AmiSSL/Developer CPU=68020
+# The default build has no AmiSSL dependency. `-lamisslstubs` resolves the
+# OpenSSL functions passed as function pointers; init is done by hand (not
+# -lamisslauto) so the agent reuses its own bsdsocket base.
+ifdef SSL
+CFLAGS  += -DAMIAGENT_SSL -I$(AMISSL_SDK)/include
+SSLLIBS  = -L$(AMISSL_SDK)/lib/AmigaOS3 -lamisslstubs
+endif
+
 all: amiagent amimon amimon-mui
 
 amiagent: amiagent.c proto.h status.h
-	$(CC) $(CFLAGS) -o $@ amiagent.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ amiagent.c $(SSLLIBS) $(LDFLAGS)
 
 amimon: amimon.c proto.h status.h
 	$(CC) $(CFLAGS) -o $@ amimon.c $(LDFLAGS)

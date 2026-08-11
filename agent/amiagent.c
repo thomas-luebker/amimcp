@@ -65,7 +65,25 @@ typedef long ssize_t;
 #include "proto.h"
 #include "status.h"
 
+#ifdef AMIAGENT_SSL
+#include <proto/amisslmaster.h>
+#include <proto/amissl.h>
+#include <libraries/amisslmaster.h>
+#include <libraries/amissl.h>
+#include <amissl/amissl.h>
+#endif
+
 struct Library *SocketBase = NULL;
+
+#ifdef AMIAGENT_SSL
+/* TLS via AmiSSL. The agent serves one connection at a time, so a single
+ * `g_ssl` selects the transport for send_all/recv_all: non-NULL = this
+ * connection is encrypted, NULL = plain. */
+struct Library *AmiSSLMasterBase = NULL, *AmiSSLBase = NULL;
+static SSL_CTX *g_ssl_ctx = NULL;    /* server context with the cert, or NULL */
+static SSL     *g_ssl     = NULL;    /* the TLS connection being served, or NULL */
+static int      g_ssl_errno;         /* AmiSSL's errno sink */
+#endif
 /* Opened on demand: only truecolor screens need it, and plenty of Amigas do
  * not have it at all. */
 struct Library *CyberGfxBase = NULL;
@@ -180,6 +198,20 @@ static int sock_readable(int sock, long secs)
 /* Read exactly len bytes. Returns 1 on success, 0 on EOF/error/break. */
 static int recv_all(int sock, UBYTE *buf, ULONG len)
 {
+#ifdef AMIAGENT_SSL
+    if (g_ssl) {
+        /* SSL_read returns decrypted bytes; a TLS record may hold several
+         * requests' worth, so the library buffers what select() can't see —
+         * hence no WaitSelect here. */
+        while (len) {
+            int got = SSL_read(g_ssl, buf, (int)(len > 0x7000 ? 0x7000 : len));
+            if (got <= 0) return 0;
+            buf += got;
+            len -= (ULONG)got;
+        }
+        return 1;
+    }
+#endif
     while (len) {
         long got;
         int r = sock_readable(sock, 120);
@@ -194,6 +226,17 @@ static int recv_all(int sock, UBYTE *buf, ULONG len)
 
 static int send_all(int sock, const UBYTE *buf, ULONG len)
 {
+#ifdef AMIAGENT_SSL
+    if (g_ssl) {
+        while (len) {
+            int put = SSL_write(g_ssl, buf, (int)(len > 0x7000 ? 0x7000 : len));
+            if (put <= 0) return 0;
+            buf += put;
+            len -= (ULONG)put;
+        }
+        return 1;
+    }
+#endif
     while (len) {
         long put = send(sock, (char *)buf, (int)(len > 0x7000 ? 0x7000 : len), 0);
         if (put <= 0) return 0;
@@ -2228,14 +2271,73 @@ static void serve(int sock, const char *client)
     FreeVec(body);
 }
 
+#ifdef AMIAGENT_SSL
+/* ------------------------------------------------------------------ *
+ * TLS (AmiSSL). Opt-in second listener; the wire protocol above is spoken
+ * unchanged inside the TLS tunnel because send_all/recv_all switch on g_ssl.
+ * ------------------------------------------------------------------ */
+
+/* Bring up AmiSSL and a server context holding the cert+key in `pem`. Returns 1
+ * when TLS is ready; on any failure it leaves everything closed and the agent
+ * simply runs plain-only (exactly the "only if AmiSSL is working" contract). */
+static int ssl_init(const char *pem)
+{
+    /* A daemon must never pop a DOS requester. AmiSSL's init touches the
+     * `AmiSSL:` assign; if it is missing, an "insert volume AmiSSL" requester
+     * would otherwise block the whole agent forever. -1 makes that access fail
+     * immediately instead, so we fall back to plain cleanly. */
+    ((struct Process *)FindTask(NULL))->pr_WindowPtr = (APTR)-1;
+
+    if (!(AmiSSLMasterBase = OpenLibrary("amisslmaster.library", AMISSLMASTER_MIN_VERSION)))
+        return 0;
+    if (!InitAmiSSLMaster(AMISSL_CURRENT_VERSION, TRUE))
+        return 0;
+    if (!(AmiSSLBase = OpenAmiSSL()))
+        return 0;
+    if (InitAmiSSL(AmiSSL_ErrNoPtr, (ULONG)&g_ssl_errno,
+                   AmiSSL_SocketBase, (ULONG)SocketBase, TAG_DONE) != 0)
+        return 0;
+    if (!(g_ssl_ctx = SSL_CTX_new(TLS_server_method())))
+        return 0;
+    if (SSL_CTX_use_certificate_file(g_ssl_ctx, pem, SSL_FILETYPE_PEM) <= 0)
+        return 0;
+    if (SSL_CTX_use_PrivateKey_file(g_ssl_ctx, pem, SSL_FILETYPE_PEM) <= 0)
+        return 0;
+    return 1;
+}
+
+static void ssl_cleanup(void)
+{
+    if (g_ssl_ctx) { SSL_CTX_free(g_ssl_ctx); g_ssl_ctx = NULL; }
+    if (AmiSSLBase) { CleanupAmiSSLA(NULL); CloseAmiSSL(); AmiSSLBase = NULL; }
+    if (AmiSSLMasterBase) { CloseLibrary(AmiSSLMasterBase); AmiSSLMasterBase = NULL; }
+}
+
+/* Serve one accepted TLS connection: wrap the socket, complete the handshake,
+ * then run the normal request path with g_ssl set so every byte is encrypted. */
+static void serve_tls(int sock, const char *client)
+{
+    SSL *ssl = SSL_new(g_ssl_ctx);
+    if (!ssl) return;
+    SSL_set_fd(ssl, sock);
+    if (SSL_accept(ssl) <= 0) { SSL_free(ssl); return; }
+    g_ssl = ssl;
+    serve(sock, client);
+    g_ssl = NULL;
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+}
+#endif /* AMIAGENT_SSL */
+
 /* ------------------------------------------------------------------ *
  * Entry point
  * ------------------------------------------------------------------ */
 
-static const char *TEMPLATE = "PORT/N,TOKEN/K,QUIET/S,VERBOSE/S";
+static const char *TEMPLATE = "PORT/N,TLSPORT/N,TOKEN/K,QUIET/S,VERBOSE/S";
 
 struct args {
     LONG *port;
+    LONG *tlsport;
     STRPTR token;
     LONG quiet;      /* accepted and ignored: quiet is now the default */
     LONG verbose;
@@ -2249,6 +2351,9 @@ int main(void)
     struct sockaddr_in sa;
     int one = 1;
     int rc = RETURN_OK;
+#ifdef AMIAGENT_SSL
+    int tls_listener = -1, tlsport = 0;
+#endif
 
     memset(&a, 0, sizeof a);
     rda = ReadArgs((STRPTR)TEMPLATE, (LONG *)&a, NULL);
@@ -2257,6 +2362,9 @@ int main(void)
         return RETURN_FAIL;
     }
     if (a.port) port = (int)*a.port;
+#ifdef AMIAGENT_SSL
+    tlsport = a.tlsport ? (int)*a.tlsport : port + 1;   /* default: plain port + 1 */
+#endif
     if (a.verbose) g_quiet = 0;
     if (a.token) {
         strncpy(g_token, (const char *)a.token, sizeof g_token - 1);
@@ -2305,23 +2413,78 @@ int main(void)
 
     board_open((UWORD)port);
 
+#ifdef AMIAGENT_SSL
+    /* Bring up TLS only if AmiSSL is working AND a cert is present next to the
+     * binary — otherwise stay plain-only, which is exactly the intended
+     * behaviour on machines without AmiSSL. */
+    if (ssl_init("PROGDIR:amiagent.pem")) {
+        struct sockaddr_in ta;
+        tls_listener = socket(AF_INET, SOCK_STREAM, 0);
+        if (tls_listener >= 0) {
+            setsockopt(tls_listener, SOL_SOCKET, SO_REUSEADDR, (char *)&one, sizeof one);
+            memset(&ta, 0, sizeof ta);
+            ta.sin_family = AF_INET;
+            ta.sin_port = htons((unsigned short)tlsport);
+            ta.sin_addr.s_addr = INADDR_ANY;
+            if (bind(tls_listener, (struct sockaddr *)&ta, sizeof ta) < 0 ||
+                listen(tls_listener, 2) < 0) {
+                CloseSocket(tls_listener); tls_listener = -1;
+            }
+        }
+        if (tls_listener >= 0)
+            printf("amiagent %s: TLS on port %d (AmiSSL)\n", AMIAGENT_VERSION, tlsport);
+        else { printf("amiagent: TLS port %d unavailable; plain only\n", tlsport); ssl_cleanup(); }
+    } else {
+        printf("amiagent: TLS off (no AmiSSL or no PROGDIR:amiagent.pem); plain only\n");
+        ssl_cleanup();
+    }
+    fflush(stdout);
+#endif
+
     for (;;) {
         struct sockaddr_in ca;
-        socklen_t calen = sizeof ca;
-        int cs;
+        socklen_t calen;
+        int cs, maxfd = listener;
+        fd_set rd;
+        struct timeval tv;
+        ULONG sigs = SIGBREAKF_CTRL_C;
+        long n;
+
+        FD_ZERO(&rd);
+        FD_SET(listener, &rd);
+#ifdef AMIAGENT_SSL
+        if (tls_listener >= 0) {
+            FD_SET(tls_listener, &rd);
+            if (tls_listener > maxfd) maxfd = tls_listener;
+        }
+#endif
         /* A finite wait rather than forever: the tick is what lets the status
          * board notice a background command finishing while no client is
          * around. Two seconds of granularity costs nothing. */
-        int r = sock_readable(listener, 2);
+        tv.tv_sec = 2; tv.tv_usec = 0;
+        n = WaitSelect(maxfd + 1, &rd, NULL, NULL, &tv, &sigs);
 
-        if (r < 0) { say("\namiagent: stopping.\n"); break; }
-        if (r == 0) { board_poll_job(); continue; }
+        if (sigs & SIGBREAKF_CTRL_C) { say("\namiagent: stopping.\n"); break; }
+        if (n <= 0) { board_poll_job(); continue; }
 
-        cs = accept(listener, (struct sockaddr *)&ca, &calen);
-        if (cs < 0) continue;
-
-        serve(cs, (const char *)Inet_NtoA(ca.sin_addr.s_addr));
-        CloseSocket(cs);
+        if (FD_ISSET(listener, &rd)) {
+            calen = sizeof ca;
+            cs = accept(listener, (struct sockaddr *)&ca, &calen);
+            if (cs >= 0) {
+                serve(cs, (const char *)Inet_NtoA(ca.sin_addr.s_addr));
+                CloseSocket(cs);
+            }
+        }
+#ifdef AMIAGENT_SSL
+        if (tls_listener >= 0 && FD_ISSET(tls_listener, &rd)) {
+            calen = sizeof ca;
+            cs = accept(tls_listener, (struct sockaddr *)&ca, &calen);
+            if (cs >= 0) {
+                serve_tls(cs, (const char *)Inet_NtoA(ca.sin_addr.s_addr));
+                CloseSocket(cs);
+            }
+        }
+#endif
     }
 
     board_close();
@@ -2330,6 +2493,10 @@ out:
     input_close();
     if (CyberGfxBase) CloseLibrary(CyberGfxBase);
     if (listener >= 0) CloseSocket(listener);
+#ifdef AMIAGENT_SSL
+    if (tls_listener >= 0) CloseSocket(tls_listener);
+    ssl_cleanup();                       /* no-op if TLS never came up */
+#endif
     if (SocketBase) CloseLibrary(SocketBase);
 #ifdef AMIAGENT_OWN_LIBBASES
     if (GfxBase) CloseLibrary((struct Library *)GfxBase);
