@@ -30,6 +30,14 @@ struct AmifleetApp: App {
             }
         }
         .defaultSize(width: 980, height: 620)
+
+        WindowGroup("VNC", id: "vnc", for: UUID.self) { $id in
+            if let m = fleet.machine(id) {
+                RFBView(machine: m)
+                    .environmentObject(fleet)
+            }
+        }
+        .defaultSize(width: 1000, height: 640)
     }
 }
 

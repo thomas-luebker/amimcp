@@ -37,6 +37,7 @@ struct FleetView: View {
                             MachineTile(machine: m, status: fleet.status[m.id] ?? MachineStatus())
                                 .contextMenu {
                                     Button("Open Screen") { openWindow(id: "screen", value: m.id) }
+                                    Button("Open VNC") { openWindow(id: "vnc", value: m.id) }
                                     Button("Report & Shell") { openWindow(id: "detail", value: m.id) }
                                     Button("Edit…") { editing = m }
                                     Divider()
@@ -137,6 +138,9 @@ struct MachineTile: View {
             HStack(spacing: 8) {
                 Button("Screen") { openWindow(id: "screen", value: machine.id) }
                     .buttonStyle(WBButtonStyle()).disabled(!status.online)
+                Button("VNC") { openWindow(id: "vnc", value: machine.id) }
+                    .buttonStyle(WBButtonStyle()).disabled(!status.online)
+                    .help("Native VNC view (starts AmiVNC and renders it in amifleet)")
                 Button("Report") { openWindow(id: "detail", value: machine.id) }
                     .buttonStyle(WBButtonStyle())
                 Spacer()

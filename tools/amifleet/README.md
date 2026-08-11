@@ -20,15 +20,21 @@ no LLM in the loop. Dressed like a Workbench 3.x window because of course it is.
   and adds every agent it finds.
 - **Report & Shell** — the full `INFO` report, plus an AmigaDOS shell that runs
   commands through `EXEC` and shows the return code and captured output.
-- **Live screen** ("VNC") — the machine's frontmost screen, refreshed the way
+- **Live screen** ("Screen") — the machine's frontmost screen, refreshed the way
   the protocol intends: poll the cheap `HASH` twice a second (no pixels move)
   and pull a full `SHOT` only when the checksum changes. Mouse clicks and the
   keyboard are forwarded through `INPUT`, mapped from the fitted image back to
   real Amiga screen pixels. Chunky pixels are shown unscaled — no smoothing.
-
-Both palette (`fmt 1`) and RGB24/RTG (`fmt 2`) captures render. A full 1080p
-RTG frame is a multi-megabyte, multi-second fetch on a real 68060; the header
-shows the fetch time so slowness is visible, not mysterious.
+  Universal: works on any screen, even a Guru. A full 1080p RTG frame is a
+  multi-megabyte, multi-second fetch on a real 68060; the header shows the fetch
+  time so slowness is visible, not mysterious.
+- **VNC** — a real, smooth remote desktop via an embedded RFB client (no macOS
+  Screen Sharing, which can't complete a session with AmiVNC's 2001-era RFB).
+  It speaks RFB 3.3 straight to [AmiVNC](http://aminet.net/comm/tcp/AmiVNC.lha)
+  on the Amiga: VNC-DES auth, incremental updates, live mouse + keyboard. If
+  AmiVNC isn't installed, the window offers to install it with `amipkg install
+  amivnc` on request. Needs a standard Intuition/RTG screen (planar or
+  8/16/32-bit RTG); for anything else, use **Screen** above.
 
 ## Run it
 

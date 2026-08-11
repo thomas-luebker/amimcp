@@ -1,0 +1,319 @@
+// RFBView.swift — a native VNC window. Unlike ScreenView (which polls SHOT/HASH
+// over the agent), this drives the embedded RFBClient straight to AmiVNC: a real
+// RFB stream with incremental updates and live mouse + keyboard. No macOS Screen
+// Sharing — amifleet renders the framebuffer itself.
+
+import SwiftUI
+import CoreGraphics
+import AmigaKit
+
+@MainActor
+final class RFBSession: ObservableObject {
+    enum Phase: Equatable {
+        case checking, needsInstall, installing, starting, streaming, offline(String)
+    }
+    @Published var phase: Phase = .checking
+    @Published var image: CGImage?
+    @Published var screenSize = CGSize(width: 640, height: 256)
+    @Published var statusLine = "…"
+
+    let machine: Machine
+    private var client: RFBClient?
+    private var loop: Task<Void, Never>?
+
+    init(machine: Machine) { self.machine = machine }
+
+    /// Full lifecycle: is AmiVNC installed? → (offer install) → start → stream.
+    func start() {
+        Task { await bringUp() }
+    }
+
+    func stop() {
+        loop?.cancel(); loop = nil
+        client?.close(); client = nil
+    }
+
+    private func bringUp() async {
+        phase = .checking; statusLine = "checking AmiVNC on \(machine.host)…"
+        if await VNCLauncher.isInstalled(machine.client) {
+            await launchAndStream()
+        } else {
+            phase = .needsInstall
+            statusLine = "AmiVNC isn’t installed on \(machine.name)."
+        }
+    }
+
+    /// Install AmiVNC via amipkg on request, then continue to streaming.
+    func installAndStart() {
+        Task {
+            phase = .installing
+            statusLine = "installing AmiVNC via amipkg (downloading from Aminet)…"
+            let r = await VNCLauncher.install(machine.client)
+            if r.ok {
+                await launchAndStream()
+            } else {
+                phase = .offline(r.message); statusLine = r.message
+            }
+        }
+    }
+
+    func retry() { Task { await bringUp() } }
+
+    private func launchAndStream() async {
+        phase = .starting; statusLine = "starting AmiVNC…"
+        await VNCLauncher.startServer(machine.client)
+        let client = RFBClient(host: machine.host, port: UInt16(VNCLauncher.port))
+        self.client = client
+        loop = Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.run(client: client, password: VNCLauncher.password)
+        }
+    }
+
+    private nonisolated func run(client: RFBClient, password: String) async {
+        do {
+            try client.handshake(password: password)
+            await MainActor.run {
+                self.screenSize = CGSize(width: client.width, height: client.height)
+                self.statusLine = "\(client.width)×\(client.height) — \(client.name.trimmingCharacters(in: .whitespaces))"
+                self.phase = .streaming
+            }
+            try client.requestUpdate(incremental: false)
+            while !Task.isCancelled {
+                if let frame = try client.pumpOnce(timeout: 0.5) {
+                    let img = Self.makeImage(frame)
+                    await MainActor.run { self.image = img }
+                    try client.requestUpdate(incremental: true)
+                }
+            }
+        } catch {
+            await MainActor.run {
+                self.phase = .offline(error.localizedDescription)
+                self.statusLine = "offline: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    // ---- input (called from the AppKit layer, main thread) ---------------
+
+    /// `point` is in Amiga screen pixels; `mask` bit0=left, bit1=middle, bit2=right.
+    func pointer(at point: CGPoint, mask: UInt8) {
+        guard let client else { return }
+        let x = Int(point.x), y = Int(point.y)
+        Task.detached { try? client.sendPointer(x: x, y: y, buttonMask: mask) }
+    }
+
+    func key(_ keysym: UInt32, down: Bool) {
+        guard let client else { return }
+        Task.detached { try? client.sendKey(keysym: keysym, down: down) }
+    }
+
+    private nonisolated static func makeImage(_ f: RFBFrame) -> CGImage? {
+        let data = Data(f.rgba)
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+        return CGImage(width: f.width, height: f.height,
+                       bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: f.width * 4,
+                       space: CGColorSpaceCreateDeviceRGB(),
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                       provider: provider, decode: nil,
+                       shouldInterpolate: false, intent: .defaultIntent)
+    }
+
+    // ---- input (called from the AppKit layer, main thread) ---------------
+
+    /// `point` is in Amiga screen pixels; `mask` bit0=left, bit1=middle, bit2=right.
+}
+
+struct RFBView: View {
+    @EnvironmentObject var fleet: Fleet
+    let machine: Machine
+    @StateObject private var session: RFBSession
+
+    init(machine: Machine) {
+        self.machine = machine
+        _session = StateObject(wrappedValue: RFBSession(machine: machine))
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Text("\(machine.name) — VNC").font(WB.topaz(12)).bold().foregroundColor(.white)
+                Text(session.statusLine).font(WB.topaz(10)).foregroundColor(.white.opacity(0.85))
+                Spacer()
+                Circle().fill(session.phase == .streaming ? Color.green : Color.red)
+                    .frame(width: 9, height: 9)
+            }
+            .padding(8)
+            .background(WB.blue)
+
+            GeometryReader { geo in
+                let fitted = fittedRect(in: geo.size)
+                ZStack {
+                    WB.darkEdge.opacity(0.6)
+                    switch session.phase {
+                    case .streaming where session.image != nil:
+                        Image(decorative: session.image!, scale: 1)
+                            .resizable()
+                            .interpolation(.none)
+                            .frame(width: fitted.width, height: fitted.height)
+                        RFBInputView(session: session, displayed: fitted, screenSize: session.screenSize)
+                            .frame(width: fitted.width, height: fitted.height)
+                    case .needsInstall:
+                        installPrompt
+                    case .offline(let why):
+                        offlinePrompt(why)
+                    default:
+                        Text(session.statusLine).font(WB.topaz(12)).foregroundColor(.white)
+                    }
+                }
+                .frame(width: geo.size.width, height: geo.size.height)
+            }
+        }
+        .background(WB.gray)
+        .navigationTitle("\(machine.name) — VNC")
+        .onAppear { session.start() }
+        .onDisappear { session.stop() }
+    }
+
+    private var installPrompt: some View {
+        VStack(spacing: 12) {
+            Text("AmiVNC isn’t installed on \(machine.name).")
+                .font(WB.topaz(13)).foregroundColor(.white)
+            Text("amifleet can install it now with amipkg (downloads from Aminet).")
+                .font(WB.topaz(11)).foregroundColor(.white.opacity(0.8))
+            Button("Install AmiVNC") { session.installAndStart() }
+                .buttonStyle(WBButtonStyle())
+        }
+        .padding(24)
+    }
+
+    private func offlinePrompt(_ why: String) -> some View {
+        VStack(spacing: 12) {
+            Text("VNC unavailable").font(WB.topaz(13)).bold().foregroundColor(.white)
+            Text(why).font(WB.topaz(11)).foregroundColor(.white.opacity(0.85))
+                .multilineTextAlignment(.center).frame(maxWidth: 460)
+            Button("Retry") { session.retry() }.buttonStyle(WBButtonStyle())
+        }
+        .padding(24)
+    }
+
+    private func fittedRect(in container: CGSize) -> CGSize {
+        let s = session.screenSize
+        guard s.width > 0, s.height > 0, container.width > 0, container.height > 0 else {
+            return CGSize(width: 640, height: 256)
+        }
+        let scale = min(container.width / s.width, container.height / s.height)
+        return CGSize(width: s.width * scale, height: s.height * scale)
+    }
+}
+
+// ---- AppKit input layer: absolute pointer + keysym keyboard --------------
+
+struct RFBInputView: NSViewRepresentable {
+    let session: RFBSession
+    let displayed: CGSize
+    let screenSize: CGSize
+
+    func makeNSView(context: Context) -> Catcher {
+        let v = Catcher()
+        v.session = session
+        return v
+    }
+
+    func updateNSView(_ v: Catcher, context: Context) {
+        v.session = session
+        v.displayed = displayed
+        v.screenSize = screenSize
+    }
+
+    final class Catcher: NSView {
+        weak var session: RFBSession?
+        var displayed: CGSize = .zero
+        var screenSize: CGSize = .zero
+        private var mask: UInt8 = 0
+        private var tracking: NSTrackingArea?
+
+        override var acceptsFirstResponder: Bool { true }
+        override var isFlipped: Bool { true }               // top-left origin, like the Amiga
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let t = tracking { removeTrackingArea(t) }
+            let t = NSTrackingArea(rect: bounds,
+                                   options: [.activeInKeyWindow, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect],
+                                   owner: self, userInfo: nil)
+            addTrackingArea(t); tracking = t
+        }
+
+        private func amigaPoint(_ event: NSEvent) -> CGPoint {
+            guard displayed.width > 0, screenSize.width > 0 else { return .zero }
+            let p = convert(event.locationInWindow, from: nil)
+            let ax = max(0, min(p.x / displayed.width  * screenSize.width,  screenSize.width  - 1))
+            let ay = max(0, min(p.y / displayed.height * screenSize.height, screenSize.height - 1))
+            return CGPoint(x: ax, y: ay)
+        }
+
+        private func send(_ event: NSEvent) {
+            session?.pointer(at: amigaPoint(event), mask: mask)
+        }
+
+        override func mouseMoved(with e: NSEvent)   { send(e) }
+        override func mouseDragged(with e: NSEvent) { send(e) }
+        override func rightMouseDragged(with e: NSEvent) { send(e) }
+        override func otherMouseDragged(with e: NSEvent) { send(e) }
+
+        override func mouseDown(with e: NSEvent)  { mask |= 1; send(e); window?.makeFirstResponder(self) }
+        override func mouseUp(with e: NSEvent)    { mask &= ~1; send(e) }
+        override func rightMouseDown(with e: NSEvent) { mask |= 4; send(e) }
+        override func rightMouseUp(with e: NSEvent)   { mask &= ~4; send(e) }
+        override func otherMouseDown(with e: NSEvent) { mask |= 2; send(e) }
+        override func otherMouseUp(with e: NSEvent)   { mask &= ~2; send(e) }
+
+        // ---- keyboard: NSEvent → X11 keysym ------------------------------
+
+        override func keyDown(with e: NSEvent) { sendKey(e, down: true) }
+        override func keyUp(with e: NSEvent)   { sendKey(e, down: false) }
+
+        override func flagsChanged(with e: NSEvent) {
+            // Track modifier transitions and mirror them as keysym down/up.
+            func edge(_ flag: NSEvent.ModifierFlags, _ keysym: UInt32, _ store: inout Bool) {
+                let on = e.modifierFlags.contains(flag)
+                if on != store { session?.key(keysym, down: on); store = on }
+            }
+            edge(.shift,   0xFFE1, &shiftDown)
+            edge(.control, 0xFFE3, &ctrlDown)
+            edge(.option,  0xFFE9, &altDown)      // Alt → Amiga Amiga-key territory
+            edge(.command, 0xFFE7, &cmdDown)      // Meta → Amiga (right-Amiga)
+        }
+        private var shiftDown = false, ctrlDown = false, altDown = false, cmdDown = false
+
+        private func sendKey(_ e: NSEvent, down: Bool) {
+            guard let session else { return }
+            if let ks = Self.specialKeysyms[e.keyCode] {
+                session.key(ks, down: down)
+                return
+            }
+            if let chars = e.charactersIgnoringModifiers, let scalar = chars.unicodeScalars.first,
+               scalar.value >= 0x20 {
+                session.key(scalar.value, down: down)   // Latin-1/ASCII keysym == code point
+            }
+        }
+
+        /// macOS virtual keycode → X11 keysym for non-printable keys.
+        static let specialKeysyms: [UInt16: UInt32] = [
+            36: 0xFF0D,  // Return
+            76: 0xFF8D,  // Enter (keypad)
+            48: 0xFF09,  // Tab
+            51: 0xFF08,  // BackSpace
+            53: 0xFF1B,  // Escape
+            117: 0xFFFF, // Delete (forward)
+            123: 0xFF51, 124: 0xFF53, 125: 0xFF54, 126: 0xFF52,  // ← → ↓ ↑
+            115: 0xFF50, // Home
+            119: 0xFF57, // End
+            116: 0xFF55, // Page Up
+            121: 0xFF56, // Page Down
+            122: 0xFFBE, 120: 0xFFBF, 99: 0xFFC0, 118: 0xFFC1, 96: 0xFFC2,   // F1–F5
+            97: 0xFFC3, 98: 0xFFC4, 100: 0xFFC5, 101: 0xFFC6, 109: 0xFFC7,   // F6–F10
+        ]
+    }
+}

@@ -105,6 +105,7 @@ final class ScreenSession: ObservableObject {
 
 struct ScreenView: View {
     @EnvironmentObject var fleet: Fleet
+    @Environment(\.openWindow) private var openWindow
     let machine: Machine
     @StateObject private var session: ScreenSession
     @State private var showInspector = false
@@ -120,6 +121,9 @@ struct ScreenView: View {
                 Text("\(machine.name) — live").font(WB.topaz(12)).bold().foregroundColor(.white)
                 Text(session.statusLine).font(WB.topaz(10)).foregroundColor(.white.opacity(0.8))
                 Spacer()
+                Button("VNC") { openWindow(id: "vnc", value: machine.id) }
+                    .buttonStyle(WBButtonStyle())
+                    .help("Open the native VNC view (installs/starts AmiVNC as needed)")
                 Toggle("Inspect", isOn: $showInspector)
                     .toggleStyle(.checkbox).font(WB.topaz(11)).foregroundColor(.white)
                 Toggle("Pause", isOn: $session.paused)
