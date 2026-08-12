@@ -23,6 +23,9 @@ final class RFBSession: ObservableObject {
     @Published var dropTarget: String?
     /// Low-bandwidth BGR233 mode (AmiVNC -a): 1 byte/pixel, 4× less data.
     @Published var fast = false
+    /// Last pointer position in Amiga pixels — drawn as an overlay because
+    /// AmiVNC doesn't composite the hardware-sprite cursor into the framebuffer.
+    @Published var cursor: CGPoint?
 
     let machine: Machine
     private var client: RFBClient?
@@ -114,6 +117,7 @@ final class RFBSession: ObservableObject {
     /// `point` is in Amiga screen pixels; `mask` bit0=left, bit1=middle, bit2=right.
     func pointer(at point: CGPoint, mask: UInt8) {
         guard let client else { return }
+        cursor = point
         let x = Int(point.x), y = Int(point.y)
         Task.detached { try? client.sendPointer(x: x, y: y, buttonMask: mask) }
     }
@@ -295,6 +299,37 @@ struct RFBView: View {
         }
     }
 
+    /// A small Amiga-style arrow at the last pointer position (AmiVNC hides the
+    /// real sprite, so without this you can't tell where the cursor is).
+    @ViewBuilder private func cursorOverlay(displayed: CGSize) -> some View {
+        if let c = session.cursor, session.screenSize.width > 0 {
+            let x = c.x / session.screenSize.width * displayed.width
+            let y = c.y / session.screenSize.height * displayed.height
+            Path { p in
+                p.move(to: .zero)
+                p.addLine(to: CGPoint(x: 0, y: 15))
+                p.addLine(to: CGPoint(x: 4, y: 11))
+                p.addLine(to: CGPoint(x: 7, y: 17))
+                p.addLine(to: CGPoint(x: 9, y: 16))
+                p.addLine(to: CGPoint(x: 6, y: 10))
+                p.addLine(to: CGPoint(x: 11, y: 10))
+                p.closeSubpath()
+            }
+            .fill(Color.white)
+            .overlay(
+                Path { p in
+                    p.move(to: .zero); p.addLine(to: CGPoint(x: 0, y: 15))
+                    p.addLine(to: CGPoint(x: 4, y: 11)); p.addLine(to: CGPoint(x: 7, y: 17))
+                    p.addLine(to: CGPoint(x: 9, y: 16)); p.addLine(to: CGPoint(x: 6, y: 10))
+                    p.addLine(to: CGPoint(x: 11, y: 10)); p.closeSubpath()
+                }.stroke(Color.black, lineWidth: 0.7)
+            )
+            .frame(width: 11, height: 17)
+            .offset(x: x, y: y)
+            .allowsHitTesting(false)
+        }
+    }
+
     @ViewBuilder private func screenContent(displayed: CGSize) -> some View {
         ZStack {
             WB.darkEdge.opacity(0.6)
@@ -303,6 +338,7 @@ struct RFBView: View {
                 Image(decorative: session.image!, scale: 1)
                     .resizable().interpolation(.none)
                     .frame(width: displayed.width, height: displayed.height)
+                    .overlay(alignment: .topLeading) { cursorOverlay(displayed: displayed) }
                 RFBInputView(session: session, displayed: displayed, screenSize: session.screenSize)
                     .frame(width: displayed.width, height: displayed.height)
             case .needsInstall:
