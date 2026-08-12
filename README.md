@@ -2,7 +2,10 @@
 
 An [MCP](https://modelcontextprotocol.io) server that gives Claude hands on a
 real Amiga. It can run AmigaDOS commands, read and write files, list drawers,
-inspect the machine, capture the screen, and move the mouse and type on it.
+inspect the machine, capture the screen, and move the mouse and type on it — and
+drive GUIs *by object* (click "the OK button"), run ARexx to script any
+ARexx-aware app, and stream files of any size. The link is plain TCP by default,
+or TLS on machines with AmiSSL.
 
 You describe the problem; Claude pokes at the actual hardware.
 
@@ -50,6 +53,8 @@ Two halves:
 | `amiga_ui_click` | Click a gadget by identity (label/role/id), not coordinates |
 | `amiga_menus` | Enumerate a window's menu strip, with shortcuts |
 | `amiga_menu_select` | Invoke a menu item by name (via its keyboard shortcut) |
+| `amiga_arexx` | Run an ARexx program — `ADDRESS` any app's port, get its RESULT |
+| `amiga_rexx_ports` | List the public ARexx/message ports you can talk to |
 
 Together those are enough to actually work: read a Startup-Sequence and fix it,
 cross-compile a binary and push it over and run it, launch a GUI program and
@@ -57,13 +62,20 @@ drive it — **by object** (click "the OK button", pick a menu item) on standard
 Intuition/GadTools GUIs, or by pixels everywhere else — or just look at what the
 machine is showing when it has gone wrong.
 
-The last four are the **semantic layer** (agent 0.8.0+): `amiga_ui_tree` reads
-the Amiga's GUI as a tree of windows and gadgets with roles, labels and
-click-ready bounds, the way a screen reader sees a screen, so Claude drives the
-machine by *what things are* instead of guessing pixels. It sees standard
-Intuition/GadTools GUIs; custom-drawn content (MUI internals, games, a Guru)
-stays the job of `amiga_screenshot`. Amiga-side detail is in
+`amiga_ui_tree` … `amiga_menu_select` are the **semantic layer** (agent 0.8.0+):
+`amiga_ui_tree` reads the Amiga's GUI as a tree of windows and gadgets with
+roles, labels and click-ready bounds, the way a screen reader sees a screen, so
+Claude drives the machine by *what things are* instead of guessing pixels. It
+sees standard Intuition/GadTools GUIs; custom-drawn content (MUI internals,
+games, a Guru) stays the job of `amiga_screenshot`. Amiga-side detail is in
 [PROTOCOL.md](PROTOCOL.md) (`UITREE` / `UIACT` / `MENUS`).
+
+`amiga_arexx` and `amiga_rexx_ports` (agent 0.9.0+) add an **application
+scripting layer**: ARexx is the Amiga's inter-app command bus, so Claude can
+`amiga_rexx_ports` to see what's scriptable — Directory Opus, editors, comms,
+players — then `amiga_arexx` with `address 'PORT'; command` to drive it and read
+the result. Pixels, objects, and now app scripting: three ways to reach the
+machine.
 
 Two things are worth knowing before you drive a GUI:
 
@@ -257,18 +269,24 @@ than a client one.
 
 ## Security — read this before opening the port
 
-`amiagent` runs arbitrary commands for anyone who can reach its port, and the
-protocol is unencrypted. That is a deliberate trade: classic Amigas have no TLS
-without AmiSSL, and requiring AmiSSL just to reach the machine you are trying to
-repair defeats the purpose.
+`amiagent` runs arbitrary commands for anyone who can reach its port. The
+default transport is plain TCP — requiring encryption just to reach the machine
+you are trying to repair would defeat the purpose.
 
-So: **set a `TOKEN`, keep it on a LAN you trust, and never forward the port.**
-Without a token, anything on your network segment can run `Format` on your
-system partition. The agent warns loudly when started without one.
+So, whatever else you do: **set a `TOKEN`, keep it on a LAN you trust, and never
+forward the port.** Without a token, anything on your network segment can run
+`Format` on your system partition. The agent warns loudly when started without
+one.
 
-The token is compared byte-for-byte (so `A4000` and `a4000` are different
-tokens) and travels in cleartext. It stops a stray port scan, not someone with a
-packet sniffer on your LAN.
+**Optional TLS (agent 0.9.0+).** On a machine with [AmiSSL](http://aminet.net/package/util/libs/AmiSSL)
+installed, build the agent with `make SSL=1` and it opens a second, encrypted
+listener (the plain port + 1). The bundled clients — amifleet and Amiga Imager —
+try TLS first and fall back to plain automatically, pinning the agent's
+self-signed certificate trust-on-first-use (like SSH). Fast machines (68040/060,
+PiStorm, Vampire) handle it comfortably; slower ones stay on plain. With TLS the
+token and everything else travels encrypted; without it the token is compared
+byte-for-byte and travels in cleartext, so it stops a stray port scan, not
+someone with a packet sniffer on your LAN.
 
 ## Verified on
 
@@ -301,7 +319,9 @@ and about 7 seconds on the wire; the PNG that reaches Claude is around 850 KiB.
   file — SGrab compresses on the Amiga, so it transfers far less. SGrab's JPEG
   mode additionally needs `jpeg.library`; PNG does not.
 - **One command at a time**, one connection at a time.
-- **16 MiB frame cap** in both directions.
+- **16 MiB per frame.** A single request/response is capped at 16 MiB; the fleet
+  clients stream larger files past it in pieces (chunked upload via `Join`,
+  download via `GETRANGE`). The MCP file tools are one frame each.
 
 ## How it works
 
