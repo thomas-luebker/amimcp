@@ -118,10 +118,30 @@ static int g_quiet = 1;   /* silent unless VERBOSE: see say() */
  * accepting connections because of a window nobody is looking at — which is
  * exactly the wedge this daemon is supposed to not have. VERBOSE opts back in
  * for interactive debugging. */
+/* A sortable local timestamp, "YY-MM-DD HH:MM:SS", for the verbose log. */
+static void ts_now(char *out, int outsize)
+{
+    struct DateTime dt;
+    char sdate[LEN_DATSTRING], stime[LEN_DATSTRING];
+    DateStamp(&dt.dat_Stamp);
+    dt.dat_Format  = FORMAT_INT;          /* YY-MM-DD, sortable */
+    dt.dat_Flags   = 0;
+    dt.dat_StrDay  = NULL;
+    dt.dat_StrDate = sdate;
+    dt.dat_StrTime = stime;
+    if (DateToStr(&dt)) snprintf(out, outsize, "%s %s", sdate, stime);
+    else if (outsize) out[0] = '\0';
+}
+
 static void say(const char *fmt, ...)
 {
     va_list ap;
+    char ts[40];
     if (g_quiet) return;
+    /* Timestamp every verbose line — asked for by a user auto-driving tests, so
+     * the log shows what happened and when. */
+    ts_now(ts, sizeof ts);
+    printf("[%s] ", ts);
     va_start(ap, fmt);
     vprintf(fmt, ap);
     va_end(ap);
@@ -751,6 +771,66 @@ static int do_get(int sock, const UBYTE *payload, ULONG len)
     ok = pump(sock, fh, size);
     Close(fh);
     return ok;
+}
+
+/* GETRANGE: u32 offset + u32 length + path -> those `length` bytes. Lets a
+ * client stream a file past the 16 MiB frame limit in pieces (each piece a
+ * separate request), the download counterpart to sendFile's chunked upload. */
+static int do_getrange(int sock, const UBYTE *payload, ULONG len)
+{
+    ULONG offset, length;
+    char *path;
+    BPTR fh;
+    int ok;
+
+    if (len < 8) return send_err(sock, "GETRANGE needs an 8-byte offset+length prefix");
+    offset = get_be32(payload);
+    length = get_be32(payload + 4);
+    if (length > AMI_MAXFRAME) return send_err(sock, "range exceeds the 16 MiB frame limit");
+
+    path = dup_cstr(payload + 8, len - 8);
+    if (!path) return send_err(sock, "out of memory");
+    fh = Open((STRPTR)path, MODE_OLDFILE);
+    if (!fh) {
+        char msg[300];
+        sprintf(msg, "cannot open \"%s\" for reading (DOS error %ld)", path, (long)IoErr());
+        FreeVec(path); return send_err(sock, msg);
+    }
+    FreeVec(path);
+
+    if (Seek(fh, (LONG)offset, OFFSET_BEGINNING) < 0) {
+        Close(fh); return send_err(sock, "seek past end of file");
+    }
+    say("getrange: %lu bytes at %lu\n", (unsigned long)length, (unsigned long)offset);
+    if (!send_hdr(sock, ST_OK, length)) { Close(fh); return 0; }
+    ok = pump(sock, fh, length);
+    Close(fh);
+    return ok;
+}
+
+/* REXXPORTS: the Amiga's public message ports, one name per line. These are the
+ * ports CMD_AREXX can `address` - ARexx-aware applications and system ports. */
+static char g_ports[8192];
+static int do_rexxports(int sock)
+{
+    struct ExecBase *sb = SysBase;
+    struct Node *n;
+    ULONG at = 0;
+
+    /* Copy names under Forbid (no allocation or I/O while the list is frozen),
+     * then send after Permit. */
+    Forbid();
+    for (n = sb->PortList.lh_Head; n->ln_Succ; n = n->ln_Succ) {
+        if (n->ln_Name && n->ln_Name[0]) {
+            ULONG l = (ULONG)strlen(n->ln_Name);
+            if (at + l + 1 >= sizeof g_ports) break;
+            memcpy(g_ports + at, n->ln_Name, l); at += l;
+            g_ports[at++] = '\n';
+        }
+    }
+    Permit();
+    say("rexxports: %ld bytes\n", (long)at);
+    return send_resp(sock, ST_OK, g_ports, at);
 }
 
 /* PUT streams straight to disk: the frame body is consumed IOBUF bytes at a
@@ -2084,6 +2164,8 @@ static const char *cmd_name(UBYTE code)
     case CMD_UIACT:   return "UIACT";
     case CMD_MENUS:   return "MENUS";
     case CMD_AREXX:   return "AREXX";
+    case CMD_REXXPORTS: return "REXXPORTS";
+    case CMD_GETRANGE:  return "GETRANGE";
     default:          return "?";
     }
 }
@@ -2256,6 +2338,8 @@ static void serve(int sock, const char *client)
         case CMD_UIACT: do_uiact(sock, body, len); break;
         case CMD_MENUS: do_menus(sock, body, len); break;
         case CMD_AREXX: do_arexx(sock, body, len); break;
+        case CMD_REXXPORTS: do_rexxports(sock); break;
+        case CMD_GETRANGE: do_getrange(sock, body, len); break;
         case CMD_INPUT: do_input(sock, body, len); break;
         case CMD_BREAK: do_break(sock); break;
         default:       send_err(sock, "unknown command"); break;

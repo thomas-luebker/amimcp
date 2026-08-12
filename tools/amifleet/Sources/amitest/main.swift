@@ -145,6 +145,25 @@ Task {
             return
         }
 
+        // bigrt mode: chunked upload + chunked download round-trip of a big
+        // file (exercises sendFile Join-upload and download GETRANGE-streaming,
+        // over TLS when the agent offers it). Usage: amitest <host> [tok] bigrt [MB]
+        if let idx = args.firstIndex(of: "bigrt") {
+            let mb = args.count > idx + 1 ? (Int(args[idx + 1]) ?? 20) : 20
+            var data = Data(count: mb * 1024 * 1024)
+            for i in stride(from: 0, to: data.count, by: 4093) { data[i] = UInt8(i & 0xFF) }
+            let payload = data
+            let dest = "RAM:amifleet-rt.bin"
+            log("uploading \(mb) MB…")
+            try await client.sendFile(dest, payload) { f in print("[\(host)]   up \(Int(f * 100))%") }
+            log("downloading \(mb) MB…")
+            let back = try await client.download(dest, size: payload.count) { f in print("[\(host)]   dn \(Int(f * 100))%") }
+            log("round-trip \(mb) MB: \(back == payload ? "MATCH ✅" : "MISMATCH ❌")")
+            if back != payload { failed = true }
+            _ = try? await client.exec("Delete \(dest) QUIET", deadline: 10)
+            return
+        }
+
         // tls mode: exercise the auto-TLS-with-fallback wire path against a
         // given plain port (its TLS listener is port+1). Usage:
         //   amitest <host> [token] tls [port]

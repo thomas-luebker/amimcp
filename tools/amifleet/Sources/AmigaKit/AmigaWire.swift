@@ -83,6 +83,8 @@ public struct AmigaClient: Sendable {
     static let cmdMenus: UInt8 = 0x0F
     static let cmdAuth: UInt8 = 0x10
     static let cmdArexx: UInt8 = 0x12
+    static let cmdRexxPorts: UInt8 = 0x13
+    static let cmdGetRange: UInt8 = 0x14
 
     // ---- one transaction -------------------------------------------------
 
@@ -364,11 +366,59 @@ extension AmigaClient {
         return out
     }
 
-    /// Download a file's raw bytes.
+    /// List the Amiga's public message ports — what ARexx can `address`.
+    public func rexxPorts() async throws -> [String] {
+        let body = try await detached { try request(Self.cmdRexxPorts) }
+        return String(decoding: body, as: UTF8.self).split(separator: "\n").map(String.init)
+    }
+
+    /// Download a file's raw bytes (single frame; ≤ 16 MB). Use `download` for
+    /// arbitrary sizes.
     public func getFile(_ path: String, timeout: TimeInterval = 120) async throws -> Data {
         try await detached {
             try request(Self.cmdGet, Data(path.unicodeScalars.map { UInt8($0.value & 0xFF) }), timeout: timeout)
         }
+    }
+
+    /// Read `length` bytes of a file at `offset` (GETRANGE).
+    public func getRange(_ path: String, offset: Int, length: Int, timeout: TimeInterval = 120) async throws -> Data {
+        var payload = Data()
+        var o = UInt32(offset).bigEndian; withUnsafeBytes(of: &o) { payload.append(contentsOf: $0) }
+        var l = UInt32(length).bigEndian; withUnsafeBytes(of: &l) { payload.append(contentsOf: $0) }
+        payload.append(Data(path.unicodeScalars.map { UInt8($0.value & 0xFF) }))
+        let built = payload
+        return try await detached { try request(Self.cmdGetRange, built, timeout: timeout) }
+    }
+
+    /// Download a file of any size: one GET when it fits in a frame, else
+    /// streamed in ≤ `chunk` GETRANGE pieces. `size` is the file's byte length.
+    /// Reads are kept ≥ 32 KB (a PiStorm SD-read quirk corrupts smaller ones),
+    /// so a small final piece is read as a 32 KB window and trimmed.
+    public func download(_ path: String, size: Int, chunk: Int = 8 * 1024 * 1024,
+                         progress: (@Sendable (Double) -> Void)? = nil) async throws -> Data {
+        if size <= Self.maxFrame {
+            let d = try await getFile(path, timeout: 300)
+            progress?(1); return d
+        }
+        let minRead = 32 * 1024
+        var out = Data(); out.reserveCapacity(size)
+        var off = 0
+        while off < size {
+            let remaining = size - off
+            if remaining >= chunk || remaining >= minRead {
+                let n = min(chunk, remaining)
+                out.append(try await getRange(path, offset: off, length: n, timeout: 300))
+                off += n
+            } else {
+                // final sliver < 32 KB: read a 32 KB window ending at EOF, keep the tail
+                let winOff = max(0, size - minRead)
+                let win = try await getRange(path, offset: winOff, length: size - winOff, timeout: 300)
+                out.append(win.suffix(remaining))
+                off = size
+            }
+            progress?(Double(off) / Double(size))
+        }
+        return out
     }
 
     /// The agent's per-frame ceiling (AMI_MAXFRAME). GET/PUT can't exceed it in

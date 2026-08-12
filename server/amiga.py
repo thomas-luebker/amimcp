@@ -29,6 +29,8 @@ CMD_POINTER = 0x0B
 CMD_HASH = 0x0C
 CMD_UITREE = 0x0D
 CMD_AREXX = 0x12
+CMD_REXXPORTS = 0x13
+CMD_GETRANGE = 0x14
 CMD_UIACT = 0x0E
 CMD_MENUS = 0x0F
 CMD_AUTH = 0x10
@@ -251,6 +253,18 @@ class Amiga:
 
     def read_file(self, path: str) -> bytes:
         return self._request(CMD_GET, path.encode("latin-1"))
+
+    def rexx_ports(self) -> list[str]:
+        """List the Amiga's public message ports — what ARexx can `address`."""
+        text = self._request(CMD_REXXPORTS).decode("latin-1", "replace")
+        return [p for p in text.split("\n") if p]
+
+    def read_range(self, path: str, offset: int, length: int) -> bytes:
+        """Read `length` bytes of a file starting at `offset`."""
+        return self._request(
+            CMD_GETRANGE, struct.pack(">II", offset, length) + path.encode("latin-1"),
+            timeout=max(self.timeout, 120.0),
+        )
 
     def write_file(self, path: str, data: bytes) -> None:
         p = path.encode("latin-1")

@@ -57,11 +57,12 @@ final class FilesModel: ObservableObject {
         let client = self.client
         let provider = NSItemProvider()
         provider.suggestedName = e.name
+        let size = e.size
         provider.registerFileRepresentation(forTypeIdentifier: UTType.data.identifier,
                                              fileOptions: [], visibility: .all) { completion in
             Task {
                 do {
-                    let data = try await client.getFile(full, timeout: 300)
+                    let data = try await client.download(full, size: size)
                     let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(e.name)
                     try? FileManager.default.removeItem(at: tmp)
                     try data.write(to: tmp)
@@ -77,18 +78,17 @@ final class FilesModel: ObservableObject {
 
     /// Save-panel fallback (and the obvious button for people who don't drag).
     func save(_ e: AmigaDirEntry) {
-        guard e.size <= AmigaClient.maxFrame else {
-            status = "\(e.name) is over 16 MB — download of large files isn’t supported yet"
-            return
-        }
         let full = Self.join(path, e.name)
         let panel = NSSavePanel()
         panel.nameFieldStringValue = e.name
         guard panel.runModal() == .OK, let url = panel.url else { return }
         status = "downloading \(e.name)…"
+        let size = e.size
         Task {
             do {
-                let data = try await client.getFile(full, timeout: 300)
+                let data = try await client.download(full, size: size) { f in
+                    Task { @MainActor in self.status = "downloading \(e.name)… \(Int(f * 100))%" }
+                }
                 try data.write(to: url)
                 status = "saved \(e.name) (\(data.count) bytes)"
             } catch {

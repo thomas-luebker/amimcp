@@ -65,6 +65,14 @@
                          * endian) + the RESULT string (empty when rc != 0),
                          * mirroring EXEC's (rc, output). ST_ERR if ARexx (the
                          * REXX port / RexxMast) is not running. */
+#define CMD_REXXPORTS 0x13 /* list the Amiga's public message ports, one name
+                         * per line (text). Empty request. These are what
+                         * CMD_AREXX can `address` - ARexx-aware apps (DOPUS.1,
+                         * AMIGAAMP, ...) plus system ports; the caller picks. */
+#define CMD_GETRANGE 0x14 /* like GET but a byte range: payload is u32 offset +
+                         * u32 length (big-endian) + path (text). Reply is those
+                         * `length` bytes. Lets a client stream a file larger
+                         * than the 16 MiB frame limit in pieces. */
 
 /* CMD_SHOT payload is optional, and omitting it means "the whole frontmost
  * screen" exactly as before:
@@ -146,6 +154,6 @@
 #define SHOT_CHUNKY 1   /* palette + 1 byte/pixel */
 #define SHOT_RGB24  2   /* 3 bytes/pixel, no palette */
 
-#define AMIAGENT_VERSION "0.9.0"
+#define AMIAGENT_VERSION "0.10.0"
 
 #endif /* AMIMCP_PROTO_H */

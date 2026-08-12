@@ -60,6 +60,8 @@ exception: it precedes the real request on the same connection.
 | 0x10 | `AUTH` | Shared token, text                   | *(empty)* |
 | 0x11 | `HELLO`| Driver description, text             | *(empty)* |
 | 0x12 | `AREXX`| ARexx program source, text          | `rc` (u32) + RESULT string |
+| 0x13 | `REXXPORTS` | *(empty)*                       | Public port names, one per line |
+| 0x14 | `GETRANGE` | `offset` (u32) + `length` (u32) + path | `length` file bytes |
 
 Text payloads are **not** NUL-terminated; the frame length delimits them.
 
@@ -70,6 +72,12 @@ reply is the ARexx primary return code as a `u32`, then the RESULT string
 running on the Amiga (the `REXX` port / RexxMast); otherwise the agent answers
 `ST_ERR`. Because the program can `ADDRESS` any application's ARexx port, this
 is how the fleet drives ARexx-aware apps (editors, DOpus, comms, players).
+
+`REXXPORTS` returns the Amiga's public message-port names (one per line) — the
+ports `AREXX` can `ADDRESS`, so a caller can discover what is scriptable right
+now. `GETRANGE` is `GET` with an `offset`+`length` prefix, letting a client
+stream a file past the 16 MiB frame limit in pieces (the download counterpart to
+chunked upload via `Join`).
 
 ## Statuses (response `code`)
 

@@ -103,6 +103,16 @@ TOOLS = [
         },
     },
     {
+        "name": "amiga_rexx_ports",
+        "description": (
+            "List the Amiga's public message ports — the ports that amiga_arexx "
+            "can talk to with `address 'NAME'`. ARexx-aware applications publish "
+            "one (DOPUS.1, AMIGAAMP, an editor's port, ...) alongside system "
+            "ports, so this is how you discover what's scriptable right now."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "amiga_read_file",
         "description": (
             "Read a file from the Amiga. Use this for Startup-Sequence, "
@@ -536,6 +546,14 @@ def tool_arexx(ami: Amiga, args: dict) -> list[dict]:
     return [{"type": "text", "text": text}]
 
 
+def tool_rexx_ports(ami: Amiga, args: dict) -> list[dict]:
+    ports = ami.rexx_ports()
+    if not ports:
+        return [{"type": "text", "text": "No public message ports are open."}]
+    listing = "\n".join(f"  {p}" for p in ports)
+    return [{"type": "text", "text": f"{len(ports)} public port(s) — address any with amiga_arexx:\n{listing}"}]
+
+
 def tool_read_file(ami: Amiga, args: dict) -> list[dict]:
     path = args["path"]
     encoding = args.get("encoding", "auto")
@@ -839,6 +857,7 @@ def tool_key(ami: Amiga, args: dict) -> list[dict]:
 HANDLERS = {
     "amiga_shell": tool_shell,
     "amiga_arexx": tool_arexx,
+    "amiga_rexx_ports": tool_rexx_ports,
     "amiga_break": tool_break,
     "amiga_click": tool_click,
     "amiga_drag": tool_drag,
