@@ -71,6 +71,12 @@ typedef long ssize_t;
 #include <libraries/amisslmaster.h>
 #include <libraries/amissl.h>
 #include <amissl/amissl.h>
+#include <amissl/tags.h>
+#include <openssl/evp.h>
+#include <openssl/x509.h>
+#include <openssl/pem.h>
+#include <openssl/rand.h>
+#include <openssl/obj_mac.h>
 #endif
 
 struct Library *SocketBase = NULL;
@@ -79,7 +85,7 @@ struct Library *SocketBase = NULL;
 /* TLS via AmiSSL. The agent serves one connection at a time, so a single
  * `g_ssl` selects the transport for send_all/recv_all: non-NULL = this
  * connection is encrypted, NULL = plain. */
-struct Library *AmiSSLMasterBase = NULL, *AmiSSLBase = NULL;
+struct Library *AmiSSLMasterBase = NULL, *AmiSSLBase = NULL, *AmiSSLExtBase = NULL;
 static SSL_CTX *g_ssl_ctx = NULL;    /* server context with the cert, or NULL */
 static SSL     *g_ssl     = NULL;    /* the TLS connection being served, or NULL */
 static int      g_ssl_errno;         /* AmiSSL's errno sink */
@@ -2364,6 +2370,80 @@ static void serve(int sock, const char *client)
 /* Bring up AmiSSL and a server context holding the cert+key in `pem`. Returns 1
  * when TLS is ready; on any failure it leaves everything closed and the agent
  * simply runs plain-only (exactly the "only if AmiSSL is working" contract). */
+static int file_exists(const char *path)
+{
+    BPTR l = Lock((STRPTR)path, ACCESS_READ);
+    if (l) { UnLock(l); return 1; }
+    return 0;
+}
+
+/* Classic Amigas have no /dev/random. Gather what entropy there is - the clock
+ * (1/50 s ticks, re-read across a little work), task and allocation addresses,
+ * free memory - and stir it into OpenSSL's RNG. Not military-grade, but enough
+ * to make a per-machine self-signed key unpredictable to a LAN peer; the
+ * trust-on-first-use pin the client keeps is what actually binds identity. */
+static void seed_rng(void)
+{
+    struct { struct DateStamp ds; APTR task; ULONG chip, fast; APTR a[8]; } e;
+    int i;
+    e.task = FindTask(NULL);
+    e.chip = AvailMem(MEMF_CHIP);
+    e.fast = AvailMem(MEMF_FAST);
+    for (i = 0; i < 8; i++) {
+        DateStamp(&e.ds);
+        e.a[i] = AllocMem(64, MEMF_ANY);
+        RAND_seed(&e, sizeof e);
+    }
+    for (i = 0; i < 8; i++) if (e.a[i]) FreeMem(e.a[i], 64);
+}
+
+/* Generate a self-signed EC (P-256) cert+key into `pem` if it isn't there yet,
+ * so every agent gets its own identity on first run - no cert to ship or copy.
+ * Returns 1 if a usable cert exists afterwards. */
+static int ssl_ensure_cert(const char *pem)
+{
+    EVP_PKEY_CTX *pctx = NULL;
+    EVP_PKEY *pkey = NULL;
+    X509 *x = NULL;
+    X509_NAME *name;
+    BIO *out = NULL;
+    struct DateStamp ds;
+    int ok = 0;
+
+    if (file_exists(pem)) return 1;
+
+    seed_rng();
+
+    if (!(pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL))) goto done;
+    if (EVP_PKEY_keygen_init(pctx) <= 0) goto done;
+    if (EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1) <= 0) goto done;
+    if (EVP_PKEY_keygen(pctx, &pkey) <= 0) goto done;
+
+    if (!(x = X509_new())) goto done;
+    X509_set_version(x, 2);
+    DateStamp(&ds);
+    ASN1_INTEGER_set(X509_get_serialNumber(x), (long)(ds.ds_Days * 86400 + ds.ds_Tick + 1));
+    X509_gmtime_adj(X509_getm_notBefore(x), 0);
+    X509_gmtime_adj(X509_getm_notAfter(x), (long)3650 * 24 * 3600);
+    X509_set_pubkey(x, pkey);
+    name = X509_get_subject_name(x);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)"amiagent", -1, -1, 0);
+    X509_set_issuer_name(x, name);           /* self-signed: issuer == subject */
+    if (!X509_sign(x, pkey, EVP_sha256())) goto done;
+
+    if (!(out = BIO_new_file(pem, "w"))) goto done;
+    if (!PEM_write_bio_PrivateKey(out, pkey, NULL, NULL, 0, NULL, NULL)) goto done;
+    if (!PEM_write_bio_X509(out, x)) goto done;
+    ok = 1;
+
+done:
+    if (out) BIO_free(out);
+    if (x) X509_free(x);
+    if (pkey) EVP_PKEY_free(pkey);
+    if (pctx) EVP_PKEY_CTX_free(pctx);
+    return ok;
+}
+
 static int ssl_init(const char *pem)
 {
     /* A daemon must never pop a DOS requester. AmiSSL's init touches the
@@ -2374,14 +2454,21 @@ static int ssl_init(const char *pem)
 
     if (!(AmiSSLMasterBase = OpenLibrary("amisslmaster.library", AMISSLMASTER_MIN_VERSION)))
         return 0;
-    if (!InitAmiSSLMaster(AMISSL_CURRENT_VERSION, TRUE))
-        return 0;
-    if (!(AmiSSLBase = OpenAmiSSL()))
-        return 0;
-    if (InitAmiSSL(AmiSSL_ErrNoPtr, (ULONG)&g_ssl_errno,
-                   AmiSSL_SocketBase, (ULONG)SocketBase, TAG_DONE) != 0)
+    /* OpenAmiSSLTags is the current one-call init: it opens the core AND the
+     * extended library (X509/EVP/PEM live there), wires our socket base, and
+     * returns 0 on success. UsesOpenSSLStructs = TRUE because we touch X509/EVP
+     * structs directly to self-sign a cert. */
+    if (OpenAmiSSLTags(AMISSL_CURRENT_VERSION,
+                       AmiSSL_UsesOpenSSLStructs, TRUE,
+                       AmiSSL_GetAmiSSLBase,    (ULONG)&AmiSSLBase,
+                       AmiSSL_GetAmiSSLExtBase, (ULONG)&AmiSSLExtBase,
+                       AmiSSL_SocketBase,       (ULONG)SocketBase,
+                       AmiSSL_ErrNoPtr,         (ULONG)&g_ssl_errno,
+                       TAG_DONE) != 0 || !AmiSSLBase)
         return 0;
     if (!(g_ssl_ctx = SSL_CTX_new(TLS_server_method())))
+        return 0;
+    if (!ssl_ensure_cert(pem))            /* self-sign one on first run */
         return 0;
     if (SSL_CTX_use_certificate_file(g_ssl_ctx, pem, SSL_FILETYPE_PEM) <= 0)
         return 0;
@@ -2393,7 +2480,8 @@ static int ssl_init(const char *pem)
 static void ssl_cleanup(void)
 {
     if (g_ssl_ctx) { SSL_CTX_free(g_ssl_ctx); g_ssl_ctx = NULL; }
-    if (AmiSSLBase) { CleanupAmiSSLA(NULL); CloseAmiSSL(); AmiSSLBase = NULL; }
+    /* With OpenAmiSSLTags, CloseAmiSSL() alone tears it down (no CleanupAmiSSL). */
+    if (AmiSSLBase) { CloseAmiSSL(); AmiSSLBase = NULL; AmiSSLExtBase = NULL; }
     if (AmiSSLMasterBase) { CloseLibrary(AmiSSLMasterBase); AmiSSLMasterBase = NULL; }
 }
 
