@@ -94,7 +94,7 @@ Two things are worth knowing before you drive a GUI:
 
 ### Download the release
 
-Grab [`amiagent-0.7.0.lha`](https://github.com/thomas-luebker/amimcp/releases/latest)
+Grab [`amiagent-0.10.0.lha`](https://github.com/thomas-luebker/amimcp/releases/latest)
 and unpack it on the Amiga. It contains `amiagent` (68000, runs on everything)
 and `amiagent.020` (68020+), plus two status monitors you can run next to it:
 `amimon` (GadTools, runs on any OS 2.04+ machine) and `amimon-mui` (MUI 3.8+,
