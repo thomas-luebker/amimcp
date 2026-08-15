@@ -77,6 +77,22 @@ players — then `amiga_arexx` with `address 'PORT'; command` to drive it and re
 the result. Pixels, objects, and now app scripting: three ways to reach the
 machine.
 
+The scripting runs the other way too (agent 0.11.0+): the agent opens a local
+ARexx port, **`AMIAGENT`**, so Amiga applications and plain ARexx scripts can
+drive its input machinery themselves — no network client, no AI:
+
+```rexx
+address AMIAGENT
+'ACTIVATEWINDOW "CHAT --*"'      /* rc=0 found+activated, rc=5 not found */
+'ENTERTEXT "hello there<enter>"' /* keymap-correct, <key> tokens inline  */
+```
+
+Commands: `ACTIVATEWINDOW` (AmigaDOS wildcards, RESULT = matched title),
+`ENTERTEXT`/`TYPE` (commodities-style tokens: `<enter>`, `<f1>`, `<ctrl c>`,
+`<shift tab>`, `<<` for a literal `<`), `KEY`, `VERSION`, `HELP`. Check
+`show('P','AMIAGENT')` and fall back gracefully — built for applications that
+want optional input-injection without shelling out to helper binaries.
+
 Two things are worth knowing before you drive a GUI:
 
 - **Watch cheaply.** A full 1080p truecolour frame is ~6 MB over a ~1 MB/s link —
@@ -94,7 +110,7 @@ Two things are worth knowing before you drive a GUI:
 
 ### Download the release
 
-Grab [`amiagent-0.10.0.lha`](https://github.com/thomas-luebker/amimcp/releases/latest)
+Grab [`amiagent-0.11.0.lha`](https://github.com/thomas-luebker/amimcp/releases/latest)
 and unpack it on the Amiga. It contains `amiagent` (68000, runs on everything)
 and `amiagent.020` (68020+), plus two status monitors you can run next to it:
 `amimon` (GadTools, runs on any OS 2.04+ machine) and `amimon-mui` (MUI 3.8+,

@@ -2148,6 +2148,322 @@ static int do_menus(int sock, const UBYTE *body, ULONG len)
 }
 
 /* ------------------------------------------------------------------ *
+ * Local ARexx host port ("AMIAGENT")
+ * ------------------------------------------------------------------ *
+ * The inverse of CMD_AREXX: instead of the network driving ARexx, a local
+ * ARexx script drives the agent's input machinery -
+ *
+ *   address AMIAGENT
+ *   'ACTIVATEWINDOW "CHAT --*"'
+ *   'ENTERTEXT "hello<enter>"'
+ *
+ * so an application can replace its window-activation and raw-input helper
+ * binaries with two ARexx lines, gated on FindPort('AMIAGENT'). rc is 0 on
+ * success, 5 when a window was not found, 10 on a bad command - RESULT (on
+ * rc 0) carries the matched window title or requested text.
+ *
+ * The port is served from the main loop between requests; commands and the
+ * wire protocol never run concurrently, so the input.device state is shared
+ * safely with CMD_INPUT. */
+
+static struct MsgPort *g_rexxhost;
+
+static int ci_eq(const char *a, const char *b)
+{
+    while (*a && *b) {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+/* Key names match the MCP server's tables (server/amiga.py), so ARexx users
+ * and amiga_key users read the same documentation. */
+static const struct { const char *n; UWORD mask; UBYTE code; } REXX_QUALS[] = {
+    { "shift",    0x0001, 0x60 }, { "lshift",   0x0001, 0x60 },
+    { "rshift",   0x0002, 0x61 }, { "capslock", 0x0004, 0x62 },
+    { "ctrl",     0x0008, 0x63 }, { "control",  0x0008, 0x63 },
+    { "alt",      0x0010, 0x64 }, { "lalt",     0x0010, 0x64 },
+    { "ralt",     0x0020, 0x65 }, { "amiga",    0x0040, 0x66 },
+    { "lamiga",   0x0040, 0x66 }, { "ramiga",   0x0080, 0x67 },
+    { "lcommand", 0x0040, 0x66 }, { "rcommand", 0x0080, 0x67 },
+};
+
+static const struct { const char *n; UBYTE code; } REXX_KEYS[] = {
+    { "backspace", 0x41 }, { "tab",    0x42 }, { "enter",  0x43 },
+    { "return",    0x44 }, { "esc",    0x45 }, { "escape", 0x45 },
+    { "delete",    0x46 }, { "del",    0x46 }, { "space",  0x40 },
+    { "help",      0x5F }, { "up",     0x4C }, { "down",   0x4D },
+    { "right",     0x4E }, { "left",   0x4F },
+    { "f1", 0x50 }, { "f2", 0x51 }, { "f3", 0x52 }, { "f4", 0x53 },
+    { "f5", 0x54 }, { "f6", 0x55 }, { "f7", 0x56 }, { "f8", 0x57 },
+    { "f9", 0x58 }, { "f10", 0x59 },
+};
+
+static void press_raw(UBYTE code, UWORD qual)
+{
+    input_key(code, 1, qual);
+    Delay(1);
+    input_key(code, 0, qual);
+}
+
+/* One printable character with qualifiers held. Unlike input_char, dead-key
+ * prefixes are skipped: <ctrl c> means "ctrl plus the c key", and a dead-key
+ * dance under a held qualifier would confuse the keymap anyway. */
+static int press_char(UBYTE ch, UWORD extra)
+{
+    UBYTE rbuf[6];
+    LONG actual;
+    const UBYTE *r;
+
+    actual = MapANSI((STRPTR)&ch, 1, (STRPTR)rbuf, 3, NULL);
+    if (actual < 1) return 0;
+    r = rbuf + (actual - 1) * 2;
+    press_raw(r[0], (UWORD)(r[1] | extra));
+    return 1;
+}
+
+/* A commodities-style key description: zero or more qualifier words, then a
+ * key word - "enter", "ctrl c", "shift f1". A lone qualifier word ("ctrl")
+ * presses that qualifier key by itself. Words split on space or '+'. */
+static int key_token(const char *tok)
+{
+    char buf[64], *words[6];
+    int nw = 0, i, w;
+    UWORD qual = 0;
+
+    strncpy(buf, tok, sizeof buf - 1);
+    buf[sizeof buf - 1] = '\0';
+
+    for (i = 0; buf[i] && nw < 6; ) {
+        while (buf[i] == ' ' || buf[i] == '+') i++;
+        if (!buf[i]) break;
+        words[nw++] = buf + i;
+        while (buf[i] && buf[i] != ' ' && buf[i] != '+') i++;
+        if (buf[i]) buf[i++] = '\0';
+    }
+    if (!nw) return 0;
+
+    /* Every word but the last must be a qualifier. */
+    for (w = 0; w < nw - 1; w++) {
+        int hit = 0;
+        for (i = 0; i < (int)(sizeof REXX_QUALS / sizeof REXX_QUALS[0]); i++)
+            if (ci_eq(words[w], REXX_QUALS[i].n)) { qual |= REXX_QUALS[i].mask; hit = 1; break; }
+        if (!hit) return 0;
+    }
+
+    for (i = 0; i < (int)(sizeof REXX_KEYS / sizeof REXX_KEYS[0]); i++)
+        if (ci_eq(words[nw - 1], REXX_KEYS[i].n)) {
+            press_raw(REXX_KEYS[i].code, qual);
+            return 1;
+        }
+    for (i = 0; i < (int)(sizeof REXX_QUALS / sizeof REXX_QUALS[0]); i++)
+        if (ci_eq(words[nw - 1], REXX_QUALS[i].n)) {
+            press_raw(REXX_QUALS[i].code, (UWORD)(qual | REXX_QUALS[i].mask));
+            return 1;
+        }
+    if (strlen(words[nw - 1]) == 1)
+        return qual ? press_char((UBYTE)words[nw - 1][0], qual)
+                    : (input_char((UBYTE)words[nw - 1][0]), 1);
+    return 0;
+}
+
+/* Type text, expanding <token> key descriptions inline ("blah<enter>"),
+ * "<<" for a literal '<'. An unrecognised token is typed as-is, so stray
+ * angle brackets in ordinary text cannot swallow characters. */
+static void enter_text(const char *s)
+{
+    while (*s) {
+        if (s[0] == '<' && s[1] == '<') { input_char('<'); Delay(1); s += 2; continue; }
+        if (*s == '<') {
+            const char *e = strchr(s + 1, '>');
+            if (e && e - s - 1 > 0 && e - s - 1 < 48) {
+                char tok[48];
+                memcpy(tok, s + 1, (size_t)(e - s - 1));
+                tok[e - s - 1] = '\0';
+                if (key_token(tok)) { Delay(1); s = e + 1; continue; }
+            }
+        }
+        input_char((UBYTE)*s++);
+        Delay(1);
+    }
+}
+
+/* Case-insensitive title match: AmigaDOS wildcards, with '*' accepted as an
+ * alias for #? and a plain string matching as a substring (the same contract
+ * ui_find uses for window selectors). */
+static int title_match(const char *title, const char *pat)
+{
+    char pbuf[128], ptok[300];
+    LONG r;
+    size_t i, j = 0;
+
+    for (i = 0; pat[i] && j < sizeof pbuf - 3; i++) {
+        if (pat[i] == '*') { pbuf[j++] = '#'; pbuf[j++] = '?'; }
+        else pbuf[j++] = pat[i];
+    }
+    pbuf[j] = '\0';
+
+    r = ParsePatternNoCase((STRPTR)pbuf, (STRPTR)ptok, sizeof ptok);
+    if (r < 0) return 0;
+    if (r == 0) return ui_ci_contains(title, pat);
+    return MatchPatternNoCase((STRPTR)ptok, (STRPTR)title) ? 1 : 0;
+}
+
+/* Find a window by title pattern on any screen and activate it, bringing its
+ * screen forward first when needed. The window pointer is resolved under
+ * Forbid() and used just after Permit() - the same small race every by-title
+ * operation in this file accepts. */
+static int win_activate(const char *pat, char *out, size_t outsz)
+{
+    struct Screen *scr, *fscr = NULL;
+    struct Window *w, *fw = NULL;
+
+    Forbid();
+    for (scr = IntuitionBase->FirstScreen; scr && !fw; scr = scr->NextScreen)
+        for (w = scr->FirstWindow; w; w = w->NextWindow) {
+            if (!w->Title) continue;
+            if (title_match((const char *)w->Title, pat)) { fw = w; fscr = scr; break; }
+        }
+    if (fw && out && outsz) {
+        strncpy(out, (const char *)fw->Title, outsz - 1);
+        out[outsz - 1] = '\0';
+    }
+    Permit();
+
+    if (!fw) return 0;
+    if (fscr != IntuitionBase->FirstScreen) ScreenToFront(fscr);
+    ActivateWindow(fw);
+    return 1;
+}
+
+/* Dispatch one port command. rc: 0 ok, 5 not found, 10 bad command/unusable. */
+static LONG rexxhost_do(const char *line, char *res, size_t ressz)
+{
+    char buf[512], *verb, *arg;
+    int i = 0;
+
+    res[0] = '\0';
+    strncpy(buf, line, sizeof buf - 1);
+    buf[sizeof buf - 1] = '\0';
+
+    while (buf[i] == ' ') i++;
+    verb = buf + i;
+    while (buf[i] && buf[i] != ' ') i++;
+    if (buf[i]) buf[i++] = '\0';
+    while (buf[i] == ' ') i++;
+    arg = buf + i;
+
+    /* Strip one level of surrounding quotes: ARexx hands the command through
+     * verbatim, so 'ACTIVATEWINDOW "CHAT --*"' arrives quotes and all. */
+    if ((arg[0] == '"' || arg[0] == '\'') && strlen(arg) >= 2 &&
+        arg[strlen(arg) - 1] == arg[0]) {
+        arg[strlen(arg) - 1] = '\0';
+        arg++;
+    }
+
+    if (ci_eq(verb, "ACTIVATEWINDOW")) {
+        if (!arg[0]) return 10;
+        return win_activate(arg, res, ressz) ? 0 : 5;
+    }
+    if (ci_eq(verb, "ENTERTEXT") || ci_eq(verb, "TYPE")) {
+        if (!input_open()) return 10;
+        enter_text(arg);
+        return 0;
+    }
+    if (ci_eq(verb, "KEY")) {
+        if (!arg[0] || !input_open()) return 10;
+        return key_token(arg) ? 0 : 10;
+    }
+    if (ci_eq(verb, "VERSION")) {
+        strncpy(res, "amiagent " AMIAGENT_VERSION, ressz - 1);
+        res[ressz - 1] = '\0';
+        return 0;
+    }
+    if (ci_eq(verb, "HELP")) {
+        strncpy(res, "ACTIVATEWINDOW pat | ENTERTEXT text (<enter>,<ctrl c>,...) | "
+                     "KEY name | VERSION | HELP", ressz - 1);
+        res[ressz - 1] = '\0';
+        return 0;
+    }
+    return 10;
+}
+
+static void rexxhost_drain(void)
+{
+    struct RexxMsg *rm;
+
+    if (!g_rexxhost) return;
+    while ((rm = (struct RexxMsg *)GetMsg(g_rexxhost))) {
+        char res[128];
+        const char *cmd = (const char *)rm->rm_Args[0];
+        LONG rc = cmd ? rexxhost_do(cmd, res, sizeof res) : 10;
+
+        rm->rm_Result1 = rc;
+        rm->rm_Result2 = 0;
+        if (rc == 0 && (rm->rm_Action & RXFF_RESULT) && res[0])
+            rm->rm_Result2 = (LONG)CreateArgstring((STRPTR)res, (LONG)strlen(res));
+        ReplyMsg((struct Message *)rm);
+        say("arexx-port: \"%s\" rc=%ld\n", cmd ? cmd : "(null)", (long)rc);
+    }
+}
+
+/* rexxsyslib stays open for the port's lifetime (CreateArgstring on replies);
+ * do_arexx's own open/close nests harmlessly on the same base. */
+static int rexxhost_open(void)
+{
+    struct MsgPort *p;
+
+    RexxSysBase = (struct RxsLib *)OpenLibrary("rexxsyslib.library", 0);
+    if (!RexxSysBase) return 0;
+
+    Forbid();
+    if (FindPort((STRPTR)"AMIAGENT")) {   /* another agent instance owns it */
+        Permit();
+        CloseLibrary((struct Library *)RexxSysBase);
+        RexxSysBase = NULL;
+        return 0;
+    }
+    p = CreateMsgPort();
+    if (p) {
+        p->mp_Node.ln_Name = (char *)"AMIAGENT";
+        p->mp_Node.ln_Pri = 0;
+        AddPort(p);
+    }
+    Permit();
+
+    if (!p) {
+        CloseLibrary((struct Library *)RexxSysBase);
+        RexxSysBase = NULL;
+        return 0;
+    }
+    g_rexxhost = p;
+    return 1;
+}
+
+static void rexxhost_close(void)
+{
+    struct RexxMsg *rm;
+
+    if (!g_rexxhost) return;
+    RemPort(g_rexxhost);
+    while ((rm = (struct RexxMsg *)GetMsg(g_rexxhost))) {
+        rm->rm_Result1 = 20;   /* the host is going away */
+        rm->rm_Result2 = 0;
+        ReplyMsg((struct Message *)rm);
+    }
+    DeleteMsgPort(g_rexxhost);
+    g_rexxhost = NULL;
+    if (RexxSysBase) {
+        CloseLibrary((struct Library *)RexxSysBase);
+        RexxSysBase = NULL;
+    }
+}
+
+/* ------------------------------------------------------------------ *
  * Status board, request half
  * ------------------------------------------------------------------ */
 
@@ -2585,6 +2901,13 @@ int main(void)
 
     board_open((UWORD)port);
 
+    if (rexxhost_open())
+        printf("amiagent %s: local ARexx port \"AMIAGENT\" ready\n", AMIAGENT_VERSION);
+    else
+        printf("amiagent: no local ARexx port (rexxsyslib.library missing or "
+               "another agent owns AMIAGENT)\n");
+    fflush(stdout);
+
 #ifdef AMIAGENT_SSL
     /* Bring up TLS only if AmiSSL is working AND a cert is present next to the
      * binary — otherwise stay plain-only, which is exactly the intended
@@ -2619,7 +2942,8 @@ int main(void)
         int cs, maxfd = listener;
         fd_set rd;
         struct timeval tv;
-        ULONG sigs = SIGBREAKF_CTRL_C;
+        ULONG portsig = g_rexxhost ? (1UL << g_rexxhost->mp_SigBit) : 0;
+        ULONG sigs = SIGBREAKF_CTRL_C | portsig;
         long n;
 
         FD_ZERO(&rd);
@@ -2637,6 +2961,7 @@ int main(void)
         n = WaitSelect(maxfd + 1, &rd, NULL, NULL, &tv, &sigs);
 
         if (sigs & SIGBREAKF_CTRL_C) { say("\namiagent: stopping.\n"); break; }
+        if (portsig && (sigs & portsig)) rexxhost_drain();
         if (n <= 0) { board_poll_job(); continue; }
 
         if (FD_ISSET(listener, &rd)) {
@@ -2662,6 +2987,7 @@ int main(void)
     board_close();
 
 out:
+    rexxhost_close();
     input_close();
     if (CyberGfxBase) CloseLibrary(CyberGfxBase);
     if (listener >= 0) CloseSocket(listener);
