@@ -40,6 +40,11 @@ struct DetailView: View {
             Text("\(machine.name)  ·  \(status.agent)").font(WB.topaz(12)).bold()
                 .foregroundColor(.white)
             Spacer()
+            Button("Unfreeze IMP") { unfreezeIMP() }
+                .buttonStyle(WBButtonStyle())
+                .disabled(!status.online || running)
+                .help("Drop the imp3 player task to priority -1 so a spinning "
+                      + "UI cannot starve the MP3 decoder (needs agent 0.12+)")
             Button("Refresh") { fleet.refreshNow() }.buttonStyle(WBButtonStyle())
         }
         .padding(8)
@@ -117,6 +122,36 @@ struct DetailView: View {
             .bevel(sunken: true)
         }
         .padding(8)
+    }
+
+    // The channel-lore IMP freeze fix, one click: imp3 occasionally spins at
+    // 100% CPU and, at priority 0, starves its own MP3 decoder. Dropping the
+    // player task to -1 lets the decoder keep running through the bug
+    // (yelworC's remedy). Runs as ARexx against the agent's AMIAGENT port,
+    // so it reaches Workbench-started tasks that ChangeTaskPri cannot.
+    private func unfreezeIMP() {
+        guard !running else { return }
+        running = true
+        Task {
+            defer { running = false }
+            let script = """
+            options results
+            if ~show('P','AMIAGENT') then return 'no AMIAGENT port - needs amiagent 0.12+'
+            address 'AMIAGENT'
+            'TASKPRI "imp3" -1'
+            if rc = 5 then return 'no imp3 task running on this machine'
+            if rc ~= 0 then return 'TASKPRI failed, rc=' || rc
+            return 'decoder protected: ' || result
+            """
+            do {
+                let (rc, out) = try await machine.client.arexx(script)
+                transcript.append(ShellEntry(command: "Unfreeze IMP", rc: rc,
+                    output: out.trimmingCharacters(in: .whitespacesAndNewlines)))
+            } catch {
+                transcript.append(ShellEntry(command: "Unfreeze IMP", rc: -1,
+                    output: error.localizedDescription))
+            }
+        }
     }
 
     private func run() {

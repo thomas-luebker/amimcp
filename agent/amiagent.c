@@ -30,6 +30,7 @@ typedef long ssize_t;
 
 #include <exec/types.h>
 #include <exec/memory.h>
+#include <exec/execbase.h>
 #include <dos/dos.h>
 #include <dos/dostags.h>
 #include <dos/datetime.h>
@@ -680,6 +681,13 @@ static int do_break(int sock)
 
 struct RxsLib *RexxSysBase;   /* opened per call; the agent runs one at a time */
 
+/* The local ARexx host (defined below) must stay serviceable while do_arexx
+ * waits, or a client-sent program that does `address AMIAGENT` deadlocks the
+ * agent: we would sit in WaitPort(reply) while RexxMast sits waiting for the
+ * AMIAGENT port to answer. */
+static struct MsgPort *g_rexxhost;
+static void rexxhost_drain(void);
+
 static int do_arexx(int sock, const UBYTE *payload, ULONG len)
 {
     char *cmd;
@@ -725,7 +733,17 @@ static int do_arexx(int sock, const UBYTE *payload, ULONG len)
         return send_err(sock, "ARexx is not running (no REXX port - start RexxMast)");
     }
 
-    WaitPort(reply);
+    /* Wait for the reply, but keep serving our own ARexx port meanwhile -
+     * the program we just launched may legitimately `address AMIAGENT`. */
+    {
+        ULONG rsig = 1UL << reply->mp_SigBit;
+        ULONG hsig = g_rexxhost ? (1UL << g_rexxhost->mp_SigBit) : 0;
+        for (;;) {
+            ULONG got = Wait(rsig | hsig);
+            if (hsig && (got & hsig)) rexxhost_drain();
+            if (got & rsig) break;
+        }
+    }
     while (GetMsg(reply)) { /* exactly one - our own message comes back */ }
 
     rc = rm->rm_Result1;
@@ -2166,8 +2184,6 @@ static int do_menus(int sock, const UBYTE *body, ULONG len)
  * wire protocol never run concurrently, so the input.device state is shared
  * safely with CMD_INPUT. */
 
-static struct MsgPort *g_rexxhost;
-
 static int ci_eq(const char *a, const char *b)
 {
     while (*a && *b) {
@@ -2340,6 +2356,91 @@ static int win_activate(const char *pat, char *out, size_t outsz)
     return 1;
 }
 
+/* ------------------------------------------------------------------ *
+ * Task priority by name. ChangeTaskPri only reaches CLI processes; the tasks
+ * people actually need to re-prioritise - a Workbench-started player spinning
+ * at 100% CPU and starving its own decoder - have no CLI number at all. So:
+ * find the task by case-insensitive substring across the running task and
+ * Exec's ready/waiting lists, and SetTaskPri() it. Match, read, and set all
+ * happen under one Forbid() so the task cannot exit in between. */
+
+/* An exact (case-insensitive) name match beats a substring one: "imp3" must
+ * pick the player task "imp3", not "IMP3 - Debugger". */
+static void task_scan(const char *pat, struct Node *n,
+                      struct Task **exact, struct Task **sub)
+{
+    if (!n->ln_Name) return;
+    if (ci_eq(n->ln_Name, pat)) {
+        if (!*exact) *exact = (struct Task *)n;
+    } else if (ui_ci_contains(n->ln_Name, pat)) {
+        if (!*sub) *sub = (struct Task *)n;
+    }
+}
+
+static int task_setpri(const char *pat, LONG pri, char *out, size_t outsz)
+{
+    struct Task *hit, *exact = NULL, *sub = NULL;
+    struct Node *n;
+    char name[64];
+    LONG old = 0;
+
+    Forbid();
+    task_scan(pat, &FindTask(NULL)->tc_Node, &exact, &sub);
+    for (n = SysBase->TaskReady.lh_Head; n->ln_Succ; n = n->ln_Succ)
+        task_scan(pat, n, &exact, &sub);
+    for (n = SysBase->TaskWait.lh_Head; n->ln_Succ; n = n->ln_Succ)
+        task_scan(pat, n, &exact, &sub);
+    hit = exact ? exact : sub;
+    if (hit) {
+        strncpy(name, hit->tc_Node.ln_Name ? hit->tc_Node.ln_Name : "(unnamed)",
+                sizeof name - 1);
+        name[sizeof name - 1] = '\0';
+        old = SetTaskPri(hit, (BYTE)pri);
+    }
+    Permit();
+
+    if (!hit) return 0;
+    if (out && outsz >= sizeof name + 32)
+        sprintf(out, "%s pri %ld -> %ld", name, (long)old, (long)pri);
+    return 1;
+}
+
+static ULONG tasklist_put(char *out, size_t outsz, ULONG at, struct Node *n)
+{
+    char line[56];
+    size_t len;
+
+    strncpy(line, n->ln_Name ? n->ln_Name : "(unnamed)", 40);
+    line[40] = '\0';
+    sprintf(line + strlen(line), " (%ld)", (long)n->ln_Pri);
+    len = strlen(line);
+    if (at + len + 3 >= outsz) return at;
+    if (at) { out[at++] = ','; out[at++] = ' '; }
+    memcpy(out + at, line, len);
+    at += len;
+    out[at] = '\0';
+    return at;
+}
+
+static void task_list(const char *pat, char *out, size_t outsz)
+{
+    struct Node *n;
+    ULONG at = 0;
+
+    out[0] = '\0';
+    Forbid();
+    n = &FindTask(NULL)->tc_Node;
+    if (!pat[0] || (n->ln_Name && ui_ci_contains(n->ln_Name, pat)))
+        at = tasklist_put(out, outsz, at, n);
+    for (n = SysBase->TaskReady.lh_Head; n->ln_Succ; n = n->ln_Succ)
+        if (!pat[0] || (n->ln_Name && ui_ci_contains(n->ln_Name, pat)))
+            at = tasklist_put(out, outsz, at, n);
+    for (n = SysBase->TaskWait.lh_Head; n->ln_Succ; n = n->ln_Succ)
+        if (!pat[0] || (n->ln_Name && ui_ci_contains(n->ln_Name, pat)))
+            at = tasklist_put(out, outsz, at, n);
+    Permit();
+}
+
 /* Dispatch one port command. rc: 0 ok, 5 not found, 10 bad command/unusable. */
 static LONG rexxhost_do(const char *line, char *res, size_t ressz)
 {
@@ -2378,6 +2479,33 @@ static LONG rexxhost_do(const char *line, char *res, size_t ressz)
         if (!arg[0] || !input_open()) return 10;
         return key_token(arg) ? 0 : 10;
     }
+    if (ci_eq(verb, "TASKPRI")) {
+        /* TASKPRI <name> <pri> - the name may be quoted, pri is the last
+         * word. rc=0 + RESULT "name pri old -> new", rc=5 no such task. */
+        char *sp = strrchr(arg, ' ');
+        const char *num;
+        LONG pri;
+        if (!sp) return 10;
+        num = sp + 1;
+        if (*num == '+' || *num == '-') num++;
+        if (*num < '0' || *num > '9') return 10;
+        pri = atol(sp + 1);
+        if (pri < -128) pri = -128;
+        if (pri > 127) pri = 127;
+        *sp = '\0';
+        while (sp > arg && sp[-1] == ' ') *--sp = '\0';
+        if ((arg[0] == '"' || arg[0] == '\'') && strlen(arg) >= 2 &&
+            arg[strlen(arg) - 1] == arg[0]) {
+            arg[strlen(arg) - 1] = '\0';
+            arg++;
+        }
+        if (!arg[0]) return 10;
+        return task_setpri(arg, pri, res, ressz) ? 0 : 5;
+    }
+    if (ci_eq(verb, "TASKLIST")) {
+        task_list(arg, res, ressz);
+        return 0;
+    }
     if (ci_eq(verb, "VERSION")) {
         strncpy(res, "amiagent " AMIAGENT_VERSION, ressz - 1);
         res[ressz - 1] = '\0';
@@ -2385,7 +2513,8 @@ static LONG rexxhost_do(const char *line, char *res, size_t ressz)
     }
     if (ci_eq(verb, "HELP")) {
         strncpy(res, "ACTIVATEWINDOW pat | ENTERTEXT text (<enter>,<ctrl c>,...) | "
-                     "KEY name | VERSION | HELP", ressz - 1);
+                     "KEY name | TASKPRI name pri | TASKLIST [pat] | VERSION | HELP",
+                ressz - 1);
         res[ressz - 1] = '\0';
         return 0;
     }
@@ -2398,7 +2527,7 @@ static void rexxhost_drain(void)
 
     if (!g_rexxhost) return;
     while ((rm = (struct RexxMsg *)GetMsg(g_rexxhost))) {
-        char res[128];
+        char res[512];   /* TASKLIST needs room; the rest stays small */
         const char *cmd = (const char *)rm->rm_Args[0];
         LONG rc = cmd ? rexxhost_do(cmd, res, sizeof res) : 10;
 
