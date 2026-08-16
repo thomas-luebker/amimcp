@@ -285,6 +285,13 @@ struct RFBView: View {
         .navigationTitle("\(machine.name) — VNC")
         .onAppear { session.start() }
         .onDisappear { session.stop() }
+        // onDisappear is NOT guaranteed when the hosting WINDOW closes -
+        // SwiftUI keeps restored window hierarchies alive - which leaked a
+        // live RFB session after the VNC window was closed: AmiVNC kept
+        // reading the 1080p framebuffer and the constant bus load visibly
+        // flickered the Amiga's real monitor. Observe the actual NSWindow
+        // close so the stream always dies with its window.
+        .background(WindowCloseObserver { session.stop() })
     }
 
     @ViewBuilder private func screenArea(_ geo: GeometryProxy) -> some View {
@@ -403,6 +410,41 @@ struct RFBView: View {
         }
         let scale = min(container.width / s.width, container.height / s.height)
         return CGSize(width: s.width * scale, height: s.height * scale)
+    }
+}
+
+// ---- window-close watchdog ----------------------------------------------
+
+/// Fires `onClose` when the view's actual NSWindow closes. SwiftUI's
+/// onDisappear can be skipped for closing windows (state restoration keeps
+/// the hierarchy alive), and a VNC session that outlives its window keeps
+/// streaming the Amiga's framebuffer forever - see the flicker bug.
+private struct WindowCloseObserver: NSViewRepresentable {
+    let onClose: () -> Void
+    func makeNSView(context: Context) -> NSView { Tracker(onClose: onClose) }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    final class Tracker: NSView {
+        let onClose: () -> Void
+        private var token: NSObjectProtocol?
+        private weak var observed: NSWindow?
+
+        init(onClose: @escaping () -> Void) {
+            self.onClose = onClose
+            super.init(frame: .zero)
+        }
+        required init?(coder: NSCoder) { nil }
+        deinit { if let token { NotificationCenter.default.removeObserver(token) } }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let w = window, w !== observed else { return }
+            if let token { NotificationCenter.default.removeObserver(token) }
+            observed = w
+            token = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: w, queue: .main
+            ) { [onClose] _ in onClose() }
+        }
     }
 }
 
