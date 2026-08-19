@@ -105,6 +105,13 @@ struct IntuitionBase *IntuitionBase = NULL;
 struct GfxBase *GfxBase = NULL;
 #endif
 
+/* AFB_FPGA is bit 10 of AttnFlags. Present in the NDK that ships with the
+ * Apollo toolchain, but not in every older one — define it if it is missing so
+ * the 68080 probe below compiles anywhere. */
+#ifndef AFF_FPGA
+#define AFF_FPGA (1L << 10)
+#endif
+
 #define IOBUF 8192
 
 /* Stack for the process a command runs in. Workbench icons routinely ask for
@@ -1004,7 +1011,13 @@ static int do_info(int sock)
     {
         ULONG af = sb->AttnFlags;
         const char *cpu = "68000";
-        if (af & AFF_68060) cpu = "68060";
+        /* The Apollo AC68080 has no AttnFlags bit of its own — exec ran out at
+         * AFB_68060 — so it reports itself as an FPGA core that is 68040
+         * compatible. Test that pair before the rest of the chain: on any
+         * machine without an FPGA CPU bit 10 is clear and the result below is
+         * exactly what it always was. */
+        if ((af & AFF_FPGA) && (af & AFF_68040)) cpu = "68080";
+        else if (af & AFF_68060) cpu = "68060";
         else if (af & AFF_68040) cpu = "68040";
         else if (af & AFF_68030) cpu = "68030";
         else if (af & AFF_68020) cpu = "68020";

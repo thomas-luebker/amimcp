@@ -135,7 +135,11 @@ machine that has it:
 ```sh
 cd agent && make                # 68000 baseline, runs on every Amiga
 cd agent && make CPU=68020      # 68020+ build
+cd agent && make CPU=68080      # Apollo 68080, speed-optimised
 ```
+
+The 68080 build requires a compiler whose target list includes `-m68080`, such
+as the Apollo-enabled GCC 6.5 toolchain. Other CPU builds remain size-optimised.
 
 Copy the resulting `amiagent` to the Amiga.
 
