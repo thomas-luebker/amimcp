@@ -331,9 +331,11 @@ and about 7 seconds on the wire; the PNG that reaches Claude is around 850 KiB.
 - **Screenshots take one of two routes.** The agent captures planar screens
   itself (OS 3.0+, ≤256 colours) and truecolor/RTG screens through
   `cybergraphics.library`, which Picasso96 and CyberGraphX both provide. If
-  neither fits, it falls back to running `C:sgrab` on the Amiga and fetching the
+  neither fits, it falls back to running SGrab on the Amiga and fetching the
   file — SGrab compresses on the Amiga, so it transfers far less. SGrab's JPEG
-  mode additionally needs `jpeg.library`; PNG does not.
+  mode additionally needs `jpeg.library`; PNG does not. `C:sgrab.exe` is used in
+  preference to `C:sgrab` when it exists: yelworC's IMP screenshot wrapper takes
+  over the plain name and would answer our argument line with a requester.
 - **One command at a time**, one connection at a time.
 - **16 MiB per frame.** A single request/response is capped at 16 MiB; the fleet
   clients stream larger files past it in pieces (chunked upload via `Join`,

@@ -24,7 +24,7 @@ sys.path.insert(0, HERE)
 import amimcp  # noqa: E402
 import fake_agent  # noqa: E402
 import png  # noqa: E402
-from amiga import Amiga, AmigaError, AmigaUnreachable  # noqa: E402
+from amiga import Amiga, AmigaError, AmigaUnreachable, DirEntry  # noqa: E402
 
 
 def free_port() -> int:
@@ -528,10 +528,6 @@ class TestMCP(Base):
             json.dumps(self.tool(name))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestRegionCaptureAndProbes(Base):
     """The cheap-observation ops: region capture, hashing, screens, pointer."""
 
@@ -617,3 +613,62 @@ class TestDragAndHold(Base):
         out = amimcp.tool_button(self.ami, {"down": True})
         self.assertIn("HELD DOWN", out[0]["text"])
         self.assertIn("amiga_button down=false", out[0]["text"])
+
+
+class FakeSgrabAmiga:
+    """Just enough Amiga for the SGrab fallback: a C: listing, EXEC and GET."""
+
+    def __init__(self, has_exe: bool, payload: bytes = b"\x89PNG fake"):
+        self.names = ["Dir", "List", "sgrab"] + (["SGrab.exe"] if has_exe else [])
+        self.payload = payload
+        self.commands: list[str] = []
+        self.listed: list[str] = []
+
+    def list_dir(self, path):
+        self.listed.append(path)
+        return [DirEntry(is_dir=False, size=1, protection="----rwed",
+                         date="20-Aug-26", name=n) for n in self.names]
+
+    def exec_command(self, command, timeout=120.0):
+        self.commands.append(command)
+        return 0, ""
+
+    def read_file(self, path):
+        return self.payload
+
+
+class TestSgrabFallback(unittest.TestCase):
+    """Which SGrab we shell out to, given yelworC's wrapper may own the name."""
+
+    def test_plain_name_on_a_stock_install(self):
+        ami = FakeSgrabAmiga(has_exe=False)
+        self.assertEqual(amimcp._sgrab_command(ami), "C:sgrab")
+        self.assertEqual(ami.listed, ["C:"])
+
+    def test_a_c_that_will_not_list_leaves_the_old_behaviour(self):
+        ami = FakeSgrabAmiga(has_exe=True)
+        ami.list_dir = lambda path: (_ for _ in ()).throw(AmigaError("no lock"))
+        self.assertEqual(amimcp._sgrab_command(ami), "C:sgrab")
+
+    def test_binary_wins_where_the_arexx_wrapper_installed_it(self):
+        ami = FakeSgrabAmiga(has_exe=True)
+        self.assertEqual(amimcp._sgrab_command(ami), "C:sgrab.exe")
+
+    def test_grab_runs_the_binary_not_the_wrapper(self):
+        ami = FakeSgrabAmiga(has_exe=True)
+        data, mime, note = amimcp._grab_with_sgrab(ami, "png", 85)
+        grab = [c for c in ami.commands if "sgrab" in c.lower() and "Delete" not in c]
+        self.assertEqual(grab, ["C:sgrab.exe PNG RAM:amimcp-grab.png"])
+        self.assertEqual(mime, "image/png")
+        self.assertIn("C:sgrab.exe", note)
+        self.assertEqual(data, ami.payload)
+
+    def test_grab_still_runs_plain_sgrab_where_there_is_no_binary(self):
+        ami = FakeSgrabAmiga(has_exe=False)
+        amimcp._grab_with_sgrab(ami, "png", 85)
+        grab = [c for c in ami.commands if "sgrab" in c.lower() and "Delete" not in c]
+        self.assertEqual(grab, ["C:sgrab PNG RAM:amimcp-grab.png"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -609,6 +609,29 @@ def tool_list_dir(ami: Amiga, args: dict) -> list[dict]:
 GRAB_TMP = "RAM:amimcp-grab"
 
 
+def _sgrab_command(ami: Amiga) -> str:
+    """Which SGrab to run — the binary, if a wrapper has taken over the name.
+
+    yelworC's IMP screenshot workflow renames the real SGrab to C:sgrab.exe
+    and puts an ARexx script in its place. That script pops a mode requester
+    for any argument line without DELAY 3 in it, and ours has none: calling
+    C:sgrab there blocks until our timeout and leaves a requester sitting on
+    the user's screen. The wrapper always brings sgrab.exe along with it, so
+    prefer that name wherever it exists — a stock install has only C:sgrab,
+    and we go on using it.
+
+    This asks the agent for C: rather than parsing a DOS command's output:
+    List reports a miss by quoting the path back at us, which is exactly the
+    string we would be looking for. A directory listing is a few KiB against
+    a grab of a megabyte or more, so the extra round trip does not show.
+    """
+    try:
+        names = {e.name.lower() for e in ami.list_dir("C:")}
+    except AmigaError:
+        names = set()          # can't tell, so behave as we always have
+    return "C:sgrab.exe" if "sgrab.exe" in names else "C:sgrab"
+
+
 def _grab_with_sgrab(ami: Amiga, fmt: str, quality: int) -> tuple[bytes, str, str]:
     """Capture via SGrab on the Amiga, then fetch the file.
 
@@ -616,18 +639,19 @@ def _grab_with_sgrab(ami: Amiga, fmt: str, quality: int) -> tuple[bytes, str, st
     get captured at all — the agent's own SHOT command only handles planar
     screens of 256 colours or fewer. It grabs and exits, so this runs
     synchronously and the return code tells us whether it worked.
+
+    Which SGrab, though, is _sgrab_command's problem — see there.
     """
     ext = "png" if fmt == "png" else "jpg"
     path = f"{GRAB_TMP}.{ext}"
     opts = "PNG" if fmt == "png" else f"JPG Q={quality}"
 
+    cmd = _sgrab_command(ami)
     ami.exec_command(f"Delete {path} QUIET", timeout=30)
-    rc, out = ami.exec_command(f"C:sgrab {opts} {path}", timeout=180)
+    rc, out = ami.exec_command(f"{cmd} {opts} {path}", timeout=180)
     if rc != 0:
-        raise AmigaError(
-            f"SGrab failed (rc={rc}): {out.strip() or 'no output'}. "
-            "Is C:sgrab installed?"
-        )
+        hint = " Is C:sgrab installed?" if cmd == "C:sgrab" else ""
+        raise AmigaError(f"{cmd} failed (rc={rc}): {out.strip() or 'no output'}.{hint}")
 
     # SGrab exits 0 even when it refuses to do the job — a missing
     # jpeg.library, for instance. The only reliable signal is whether the file
@@ -651,7 +675,7 @@ def _grab_with_sgrab(ami: Amiga, fmt: str, quality: int) -> tuple[bytes, str, st
         raise AmigaError(f"SGrab did not produce a JPEG ({len(data)} bytes)")
 
     mime = "image/png" if fmt == "png" else "image/jpeg"
-    return data, mime, f"via C:sgrab, {len(data) // 1024} KiB"
+    return data, mime, f"via {cmd}, {len(data) // 1024} KiB"
 
 
 def tool_screenshot(ami: Amiga, args: dict) -> list[dict]:
