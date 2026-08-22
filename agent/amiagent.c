@@ -42,12 +42,15 @@ typedef long ssize_t;
 #include <intuition/intuitionbase.h>
 #include <graphics/gfxbase.h>
 #include <cybergraphx/cybergraphics.h>
+#include <workbench/startup.h>
+#include <workbench/workbench.h>
 
 #include <proto/exec.h>
 #include <proto/dos.h>
 #include <proto/intuition.h>
 #include <proto/graphics.h>
 #include <proto/keymap.h>
+#include <proto/icon.h>
 #include <inline/cybergraphics.h>
 #include <proto/bsdsocket.h>
 #include <rexx/storage.h>
@@ -117,6 +120,17 @@ static UBYTE g_io[IOBUF];
 static char g_token[128];
 static int g_have_token = 0;
 static int g_quiet = 1;   /* silent unless VERBOSE: see say() */
+static int g_stop  = 0;   /* set by the ARexx QUIT command; ends the main loop */
+
+/* Non-NULL when Workbench started us from an icon rather than a Shell running
+ * us. Everything that differs between the two hangs off this: where the
+ * settings come from (tool types, not ReadArgs), and where output can go — a
+ * Workbench start has no console at all, so g_wbcon is either a window opened
+ * because VERBOSE asked for one, or nothing. */
+static struct WBStartup *g_wbs = NULL;
+static BPTR g_wbcon = 0;
+
+extern struct WBStartup *_WBenchMsg;   /* the startup code sets it; NULL from a Shell */
 
 /* Progress output is OFF by default, and that is a safety decision rather than
  * a taste one. An AmigaShell pauses its output the moment someone clicks in
@@ -140,19 +154,73 @@ static void ts_now(char *out, int outsize)
     else if (outsize) out[0] = '\0';
 }
 
+/* The one place anything reaches a screen. From a Shell that is stdout; from
+ * Workbench it is the VERBOSE window if there is one, and nowhere if there is
+ * not — a WB-started process has no console, and writing to one that is not
+ * there is not a thing to find out at the first status line. */
+static void emit(const char *text)
+{
+    if (g_wbs) {
+        if (g_wbcon) { FPuts(g_wbcon, (STRPTR)text); Flush(g_wbcon); }
+        return;
+    }
+    fputs(text, stdout);
+    fflush(stdout);
+}
+
+/* Startup lines: printed whatever QUIET says, because a daemon that starts
+ * silently looks like a daemon that failed to start. */
+static void note(const char *fmt, ...)
+{
+    va_list ap;
+    char buf[512];
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    emit(buf);
+}
+
+/* A fatal startup error — no trailing newline. Started from an icon there is
+ * nowhere to print it and the process is about to exit, so it becomes a
+ * requester instead: otherwise double-clicking amiagent before Roadshow is up
+ * would visibly do nothing at all. */
+static void fail(const char *fmt, ...)
+{
+    va_list ap;
+    char buf[256];
+    const char *arg = buf;
+
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+
+    if (g_wbs) {
+        struct EasyStruct es;
+        es.es_StructSize   = sizeof es;
+        es.es_Flags        = 0;
+        es.es_Title        = (UBYTE *)"amiagent";
+        es.es_TextFormat   = (UBYTE *)"%s";
+        es.es_GadgetFormat = (UBYTE *)"OK";
+        if (g_wbcon) { emit(buf); emit("\n"); }
+        EasyRequestArgs(NULL, &es, NULL, (APTR)&arg);
+        return;
+    }
+    emit(buf);
+    emit("\n");
+}
+
 static void say(const char *fmt, ...)
 {
     va_list ap;
-    char ts[40];
+    char ts[40], buf[640];
     if (g_quiet) return;
     /* Timestamp every verbose line — asked for by a user auto-driving tests, so
      * the log shows what happened and when. */
     ts_now(ts, sizeof ts);
-    printf("[%s] ", ts);
     va_start(ap, fmt);
-    vprintf(fmt, ap);
+    vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
-    fflush(stdout);
+    note("[%s] %s", ts, buf);
 }
 
 /* ------------------------------------------------------------------ *
@@ -2506,6 +2574,15 @@ static LONG rexxhost_do(const char *line, char *res, size_t ressz)
         task_list(arg, res, ressz);
         return 0;
     }
+    if (ci_eq(verb, "QUIT")) {
+        /* The only way to stop an agent started from an icon: a Workbench
+         * process has no CLI number, so Status/Break cannot reach it and
+         * there is no console to press Ctrl-C in. */
+        g_stop = 1;
+        strncpy(res, "amiagent stopping", ressz - 1);
+        res[ressz - 1] = '\0';
+        return 0;
+    }
     if (ci_eq(verb, "VERSION")) {
         strncpy(res, "amiagent " AMIAGENT_VERSION, ressz - 1);
         res[ressz - 1] = '\0';
@@ -2513,7 +2590,8 @@ static LONG rexxhost_do(const char *line, char *res, size_t ressz)
     }
     if (ci_eq(verb, "HELP")) {
         strncpy(res, "ACTIVATEWINDOW pat | ENTERTEXT text (<enter>,<ctrl c>,...) | "
-                     "KEY name | TASKPRI name pri | TASKLIST [pat] | VERSION | HELP",
+                     "KEY name | TASKPRI name pri | TASKLIST [pat] | QUIT | "
+                     "VERSION | HELP",
                 ressz - 1);
         res[ressz - 1] = '\0';
         return 0;
@@ -2960,6 +3038,62 @@ struct args {
     LONG verbose;
 };
 
+/* A tool type without a value ("VERBOSE") is on; one that says NO, OFF, FALSE
+ * or 0 is off. MatchToolValue does the case-insensitive, |-separated compare
+ * the Workbench convention expects. */
+static int tt_flag(STRPTR v)
+{
+    if (!v || !v[0]) return 1;
+    return !MatchToolValue(v, (STRPTR)"NO|OFF|FALSE|0");
+}
+
+/* Read the settings out of the icon that was double-clicked.
+ *
+ * This is the only channel a Workbench user has: there is no command line to
+ * put TOKEN= on, so without this the agent started from an icon is the
+ * unprotected agent, which is precisely the one nobody should be running.
+ * Requested by djbase, who starts it from an icon on a machine with no Shell
+ * open. Tool types and Shell arguments never meet — one start is one or the
+ * other. */
+static void wb_tooltypes(struct WBStartup *wbs, int *port, int *tlsport)
+{
+    struct DiskObject *dob;
+    struct WBArg *wa = wbs->sm_ArgList;
+    BPTR old;
+    CONST_STRPTR *tt;
+    STRPTR v;
+
+    if (!IconBase || !wa || wbs->sm_NumArgs < 1) return;
+
+    /* wa[0] is the tool itself — its own icon, whatever the binary was
+     * renamed to, in whatever drawer it sits. */
+    old = CurrentDir(wa[0].wa_Lock);
+    dob = GetDiskObject((STRPTR)wa[0].wa_Name);
+    CurrentDir(old);
+    if (!dob) return;
+
+    tt = (CONST_STRPTR *)dob->do_ToolTypes;
+    if (tt) {
+        if ((v = FindToolType(tt, (STRPTR)"TOKEN")) != NULL && v[0]) {
+            strncpy(g_token, (const char *)v, sizeof g_token - 1);
+            g_token[sizeof g_token - 1] = '\0';
+            g_have_token = 1;
+        }
+        if ((v = FindToolType(tt, (STRPTR)"PORT")) != NULL && v[0]) {
+            int n = atoi((const char *)v);
+            if (n > 0 && n < 65536) *port = n;
+        }
+        if (tlsport && (v = FindToolType(tt, (STRPTR)"TLSPORT")) != NULL && v[0]) {
+            int n = atoi((const char *)v);
+            if (n > 0 && n < 65536) *tlsport = n;
+        }
+        /* QUIET is the default, so it only has to undo a VERBOSE above it. */
+        if ((v = FindToolType(tt, (STRPTR)"VERBOSE")) != NULL && tt_flag(v)) g_quiet = 0;
+        if ((v = FindToolType(tt, (STRPTR)"QUIET")) != NULL && tt_flag(v)) g_quiet = 1;
+    }
+    FreeDiskObject(dob);
+}
+
 int main(void)
 {
     struct RDArgs *rda;
@@ -2968,36 +3102,73 @@ int main(void)
     struct sockaddr_in sa;
     int one = 1;
     int rc = RETURN_OK;
+    int tlsport = 0;
 #ifdef AMIAGENT_SSL
-    int tls_listener = -1, tlsport = 0;
+    int tls_listener = -1;
+#else
+    (void)tlsport;
 #endif
 
-    memset(&a, 0, sizeof a);
-    rda = ReadArgs((STRPTR)TEMPLATE, (LONG *)&a, NULL);
-    if (!rda) {
-        PrintFault(IoErr(), (STRPTR)"amiagent");
-        return RETURN_FAIL;
+    g_wbs = _WBenchMsg;
+    if (g_wbs) {
+        wb_tooltypes(g_wbs, &port, &tlsport);
+        /* Only now is it known whether anything wants a window. No WAIT and
+         * no CLOSE, both deliberately: the window closing with the agent is
+         * what says the agent is gone, a dead one left behind claims the
+         * opposite, and a close gadget on a console nothing ever reads from
+         * only flags EOF — it looks broken rather than doing anything.
+         * Nothing is lost by dropping them: the failures worth reading are
+         * requesters. */
+        if (!g_quiet)
+            g_wbcon = Open((STRPTR)"CON:0/40/640/180/amiagent", MODE_NEWFILE);
+        if (!g_have_token) {
+            /* From a Shell the same situation prints a warning and carries on,
+             * because someone typed the command and is reading the reply. From
+             * an icon nobody reads anything, so the one case that matters —
+             * an unconfigured agent left wide open on the network — has to
+             * stop and say so. */
+            struct EasyStruct es;
+            es.es_StructSize   = sizeof es;
+            es.es_Flags        = 0;
+            es.es_Title        = (UBYTE *)"amiagent";
+            es.es_TextFormat   = (UBYTE *)
+                "No TOKEN tool type is set in this icon.\n\n"
+                "amiagent runs whatever commands it is sent. Without a token,\n"
+                "anything on this network can run any command on this Amiga.\n\n"
+                "Add a TOKEN=<secret> tool type to the icon (Workbench:\n"
+                "Icons/Information) and start it again.";
+            es.es_GadgetFormat = (UBYTE *)"Start anyway|Quit";
+            if (!EasyRequestArgs(NULL, &es, NULL, NULL)) { rc = RETURN_WARN; goto out; }
+        }
+    } else {
+        memset(&a, 0, sizeof a);
+        rda = ReadArgs((STRPTR)TEMPLATE, (LONG *)&a, NULL);
+        if (!rda) {
+            PrintFault(IoErr(), (STRPTR)"amiagent");
+            return RETURN_FAIL;
+        }
+        if (a.port) port = (int)*a.port;
+        if (a.tlsport) tlsport = (int)*a.tlsport;
+        if (a.verbose) g_quiet = 0;
+        if (a.token) {
+            strncpy(g_token, (const char *)a.token, sizeof g_token - 1);
+            g_token[sizeof g_token - 1] = '\0';
+            g_have_token = 1;
+        }
+        FreeArgs(rda);
     }
-    if (a.port) port = (int)*a.port;
 #ifdef AMIAGENT_SSL
-    tlsport = a.tlsport ? (int)*a.tlsport : port + 1;   /* default: plain port + 1 */
+    if (tlsport <= 0) tlsport = port + 1;   /* default: plain port + 1 */
 #endif
-    if (a.verbose) g_quiet = 0;
-    if (a.token) {
-        strncpy(g_token, (const char *)a.token, sizeof g_token - 1);
-        g_token[sizeof g_token - 1] = '\0';
-        g_have_token = 1;
-    }
-    FreeArgs(rda);
 
     SocketBase = OpenLibrary((STRPTR)"bsdsocket.library", 4);
     if (!SocketBase) {
-        printf("amiagent: no bsdsocket.library - start your TCP/IP stack first.\n");
-        return RETURN_FAIL;
+        fail("amiagent: no bsdsocket.library - start your TCP/IP stack first.");
+        rc = RETURN_FAIL; goto out;
     }
 
     listener = socket(AF_INET, SOCK_STREAM, 0);
-    if (listener < 0) { printf("amiagent: socket() failed\n"); rc = RETURN_FAIL; goto out; }
+    if (listener < 0) { fail("amiagent: socket() failed"); rc = RETURN_FAIL; goto out; }
 
     setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, (char *)&one, sizeof one);
 
@@ -3007,35 +3178,46 @@ int main(void)
     sa.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(listener, (struct sockaddr *)&sa, sizeof sa) < 0) {
-        printf("amiagent: cannot bind port %d (already in use?)\n", port);
+        fail("amiagent: cannot bind port %d (already in use?)", port);
         rc = RETURN_FAIL; goto out;
     }
     if (listen(listener, 2) < 0) {
-        printf("amiagent: listen() failed\n");
+        fail("amiagent: listen() failed");
         rc = RETURN_FAIL; goto out;
     }
 
     if (!g_have_token)
-        printf("amiagent %s: listening on port %d - NO TOKEN SET, anyone on this\n"
-               "  network can run commands here. Restart with TOKEN=<secret>.\n",
-               AMIAGENT_VERSION, port);
+        note("amiagent %s: listening on port %d - NO TOKEN SET, anyone on this\n"
+             "  network can run commands here. Restart with %s.\n",
+             AMIAGENT_VERSION, port,
+             g_wbs ? "a TOKEN=<secret> tool type in the icon" : "TOKEN=<secret>");
     else
-        printf("amiagent %s: listening on port %d (token required)\n",
-               AMIAGENT_VERSION, port);
+        note("amiagent %s: listening on port %d (token required)\n",
+             AMIAGENT_VERSION, port);
     /* The banner always prints: it is one line, written before any client can
      * connect, and without it a quiet-by-default daemon looks like it failed
      * to start. Per-request chatter is what VERBOSE controls. */
-    printf("Press Ctrl-C to stop.%s\n", g_quiet ? "  (VERBOSE for per-command output)" : "");
-    fflush(stdout);
 
     board_open((UWORD)port);
 
     if (rexxhost_open())
-        printf("amiagent %s: local ARexx port \"AMIAGENT\" ready\n", AMIAGENT_VERSION);
+        note("amiagent %s: local ARexx port \"AMIAGENT\" ready\n", AMIAGENT_VERSION);
     else
-        printf("amiagent: no local ARexx port (rexxsyslib.library missing or "
-               "another agent owns AMIAGENT)\n");
-    fflush(stdout);
+        note("amiagent: no local ARexx port (rexxsyslib.library missing or "
+             "another agent owns AMIAGENT)\n");
+
+    /* Only now is it known what will actually stop this instance, and telling
+     * someone to use an ARexx port that failed to open is worse than saying
+     * nothing. A Workbench start with neither a console nor the port has no
+     * stop at all - which only happens when a second agent already owns
+     * AMIAGENT, and that one is the one to talk to. */
+    if (!g_wbs || g_wbcon)
+        note("Press Ctrl-C%s to stop%s.%s\n",
+             g_wbcon ? " in this window" : "",
+             g_rexxhost ? ", or 'address AMIAGENT QUIT' from ARexx" : "",
+             g_quiet ? "  (VERBOSE for per-command output)" : "");
+    else if (g_rexxhost)
+        note("Stop it with 'address AMIAGENT QUIT' from ARexx.\n");
 
 #ifdef AMIAGENT_SSL
     /* Bring up TLS only if AmiSSL is working AND a cert is present next to the
@@ -3056,13 +3238,12 @@ int main(void)
             }
         }
         if (tls_listener >= 0)
-            printf("amiagent %s: TLS on port %d (AmiSSL)\n", AMIAGENT_VERSION, tlsport);
-        else { printf("amiagent: TLS port %d unavailable; plain only\n", tlsport); ssl_cleanup(); }
+            note("amiagent %s: TLS on port %d (AmiSSL)\n", AMIAGENT_VERSION, tlsport);
+        else { note("amiagent: TLS port %d unavailable; plain only\n", tlsport); ssl_cleanup(); }
     } else {
-        printf("amiagent: TLS off (no AmiSSL or no PROGDIR:amiagent.pem); plain only\n");
+        note("amiagent: TLS off (no AmiSSL or no PROGDIR:amiagent.pem); plain only\n");
         ssl_cleanup();
     }
-    fflush(stdout);
 #endif
 
     for (;;) {
@@ -3091,6 +3272,7 @@ int main(void)
 
         if (sigs & SIGBREAKF_CTRL_C) { say("\namiagent: stopping.\n"); break; }
         if (portsig && (sigs & portsig)) rexxhost_drain();
+        if (g_stop) { note("amiagent: stopping (ARexx QUIT).\n"); break; }
         if (n <= 0) { board_poll_job(); continue; }
 
         if (FD_ISSET(listener, &rd)) {
@@ -3125,6 +3307,7 @@ out:
     ssl_cleanup();                       /* no-op if TLS never came up */
 #endif
     if (SocketBase) CloseLibrary(SocketBase);
+    if (g_wbcon) { Close(g_wbcon); g_wbcon = 0; }
 #ifdef AMIAGENT_OWN_LIBBASES
     if (GfxBase) CloseLibrary((struct Library *)GfxBase);
     if (IntuitionBase) CloseLibrary((struct Library *)IntuitionBase);

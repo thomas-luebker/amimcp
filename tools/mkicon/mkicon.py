@@ -17,6 +17,7 @@ Binary layout (this order matters - DrawerData is FIRST, not last):
     Image1       20 + planar
     Image2       20 + planar
     DefaultTool  ULONG len + NUL-terminated string, when set
+    ToolTypes    ULONG (n+1)*4, then n x (ULONG len + string), when set
 
 Icons are 57x14 at depth 2, matching the drawer icons already in SYS:Programs
 so they sit on the same grid. Colours are the standard Workbench four:
@@ -258,7 +259,7 @@ def image_header():
     return struct.pack(">hhhhhIBBI", 0, 0, W, H, DEPTH, 1, 0x03, 0x00, 0)
 
 
-def build(kind, default_tool=None, x=NOPOS, y=NOPOS):
+def build(kind, default_tool=None, tooltypes=None, stack=0, x=NOPOS, y=NOPOS):
     art = {"drawer": art_drawer, "tool": art_tool, "monitor": art_monitor,
            "project": art_project}[kind]
     do_type = {"drawer": 2, "tool": 3, "monitor": 3, "project": 4}[kind]
@@ -269,9 +270,10 @@ def build(kind, default_tool=None, x=NOPOS, y=NOPOS):
 
     do = struct.pack(">HH", 0xE310, 1) + gadget
     do += bytes([do_type, 0])
-    do += struct.pack(">II", 1 if default_tool else 0, 0)      # DefaultTool, ToolTypes
+    do += struct.pack(">II", 1 if default_tool else 0,
+                      1 if tooltypes else 0)                  # DefaultTool, ToolTypes
     do += struct.pack(">ii", x, y)
-    do += struct.pack(">III", 1 if kind == "drawer" else 0, 0, 0)  # DrawerData, ToolWindow, Stack
+    do += struct.pack(">III", 1 if kind == "drawer" else 0, 0, stack)  # DrawerData, ToolWindow, Stack
     assert len(do) == 78, len(do)
 
     out = bytearray(do)
@@ -286,17 +288,45 @@ def build(kind, default_tool=None, x=NOPOS, y=NOPOS):
         if len(s) & 1:
             s += b"\0"   # keep the GlowIcon FORM below on an even offset
         out += struct.pack(">I", len(s)) + s
+    if tooltypes:
+        # ULONG (entries+1)*4, then each entry as ULONG length + NUL-terminated
+        # string. The +1 is the NULL terminator the in-memory array carries;
+        # icon.library rebuilds the array from this count.
+        out += struct.pack(">I", (len(tooltypes) + 1) * 4)
+        for t in tooltypes:
+            s = t.encode("latin-1") + b"\0"
+            if len(s) & 1:
+                s += b"\0"   # even, for the same reason as DefaultTool above
+            out += struct.pack(">I", len(s)) + s
     out += glow_form(art)
     return bytes(out)
 
 
+USAGE = ("usage: mkicon.py <out.info> <drawer|tool|monitor|project> [defaultTool]\n"
+         "                 [--stack N] [--tt TOOLTYPE]...\n"
+         "\n"
+         "  --stack N   stack the icon asks Workbench for, in bytes\n"
+         "  --tt STR    one tool type, repeatable; wrap it in parentheses -\n"
+         "              \"(PORT=7846)\" - to ship it visible but inactive")
+
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("usage: mkicon.py <out.info> <drawer|tool|monitor|project> [defaultTool]")
+    argv, tooltypes, stack = [], [], 0
+    it = iter(sys.argv[1:])
+    for arg in it:
+        if arg == "--tt":
+            tooltypes.append(next(it))
+        elif arg == "--stack":
+            stack = int(next(it), 0)
+        else:
+            argv.append(arg)
+    if len(argv) < 2:
+        print(USAGE)
         raise SystemExit(2)
-    path, kind = sys.argv[1], sys.argv[2]
-    tool = sys.argv[3] if len(sys.argv) > 3 else None
-    data = build(kind, tool)
+    path, kind = argv[0], argv[1]
+    tool = argv[2] if len(argv) > 2 else None
+    data = build(kind, tool, tooltypes, stack)
     open(path, "wb").write(data)
     print(f"wrote {path}: {len(data)} bytes ({kind}"
-          + (f", DefaultTool={tool}" if tool else "") + ")")
+          + (f", DefaultTool={tool}" if tool else "")
+          + (f", stack={stack}" if stack else "")
+          + (f", {len(tooltypes)} tool types" if tooltypes else "") + ")")

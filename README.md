@@ -89,7 +89,8 @@ address AMIAGENT
 
 Commands: `ACTIVATEWINDOW` (AmigaDOS wildcards, RESULT = matched title),
 `ENTERTEXT`/`TYPE` (commodities-style tokens: `<enter>`, `<f1>`, `<ctrl c>`,
-`<shift tab>`, `<<` for a literal `<`), `KEY`, `VERSION`, `HELP`. Check
+`<shift tab>`, `<<` for a literal `<`), `KEY`, `TASKPRI` and `TASKLIST` (by
+name, which is the reach `ChangeTaskPri` lacks), `QUIT`, `VERSION`, `HELP`. Check
 `show('P','AMIAGENT')` and fall back gracefully — built for applications that
 want optional input-injection without shelling out to helper binaries.
 
@@ -110,7 +111,7 @@ Two things are worth knowing before you drive a GUI:
 
 ### Download the release
 
-Grab [`amiagent-0.11.0.lha`](https://github.com/thomas-luebker/amimcp/releases/latest)
+Grab [`amiagent-0.13.0.lha`](https://github.com/thomas-luebker/amimcp/releases/latest)
 and unpack it on the Amiga. It contains `amiagent` (68000, runs on everything)
 and `amiagent.020` (68020+), plus two status monitors you can run next to it:
 `amimon` (GadTools, runs on any OS 2.04+ machine) and `amimon-mui` (MUI 3.8+,
@@ -154,13 +155,45 @@ amiagent TOKEN=pickasecret
 It prints that it is listening on port 7846 and waits. **Ctrl-C** stops it; if
 you backgrounded it, find it with `Status` and `Break <n> C`.
 
-Options: `PORT/N` (default 7846), `TOKEN/K`, `QUIET/S`.
+Options: `PORT/N` (default 7846), `TOKEN/K`, `QUIET/S`, `VERBOSE/S`.
 
 To start it at boot, add this to `S:User-Startup`, **after** your TCP stack
 comes up:
 
 ```
 run >NIL: amiagent TOKEN=pickasecret QUIET
+```
+
+### Or from Workbench: the icon's tool types
+
+Double-clicking `amiagent` works too, and then the settings come from the
+icon's **tool types** — there is no command line to put them on. Select the
+icon, *Icons/Information*, and edit:
+
+| Tool type | Meaning |
+|---|---|
+| `TOKEN=pickasecret` | the shared secret. **Set this one.** |
+| `PORT=7846` | the port to listen on |
+| `VERBOSE` | open a window and log every request to it |
+| `DONOTWAIT` | for a copy of the icon in `SYS:WBStartup` — read by Workbench, not by the agent |
+
+The shipped icon carries all four already, wrapped in parentheses —
+`(TOKEN=put-your-secret-here)` — which is the Workbench convention for "present
+but inactive". Remove the parentheses from the ones you want and fill in your
+secret.
+
+Started this way there is no console, so the two things you would otherwise
+never see become requesters: **no `TOKEN` set** (with the choice to start
+anyway or quit) and a startup failure such as the TCP/IP stack not being up
+yet. `VERBOSE` opens a window instead, and **Ctrl-C in that window stops the
+agent**.
+
+Without a window, the way to stop a Workbench-started agent is its own ARexx
+port:
+
+```rexx
+address AMIAGENT
+'QUIT'
 ```
 
 ### Watch it work: amimon and amimon-mui
@@ -370,6 +403,7 @@ AmigaDOS-shaped commands rather than actually running AmigaDOS.
 
 ```
 PROTOCOL.md          the wire format, and why it looks like that
+docs/RELEASING.md    the release checklist (including the Aminet replace)
 agent/amiagent.c     the Amiga daemon
 agent/amimon.c       GadTools status monitor (watches the agent's board)
 agent/amimon-mui.c   the same monitor as a MUI app (needs MUI 3.8+ to run)
@@ -387,7 +421,7 @@ tests/               end-to-end and protocol-drift tests
 tools/amibench/      CPU/memory benchmark for comparing Amigas
 tools/amifleet/      macOS fleet console — ARD-style tiles, shell, live screen
 tools/lhapack/       builds the release archive (macOS has no LHA writer)
-tools/mkicon/        writes the .info icons (classic planar + GlowIcon)
+tools/mkicon/        writes the .info icons (classic planar + GlowIcon + tool types)
 install.sh           register with Claude Code
 ```
 
