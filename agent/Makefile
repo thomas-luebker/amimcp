@@ -3,6 +3,7 @@
 #
 #   make                   → amiagent + amimon (68000 baseline; runs on every Amiga)
 #   make CPU=68020         → 68020+ build
+#   make CPU=68080         → Apollo 68080 speed-optimised build
 #   make OWNBASES=1        → open intuition/graphics by hand (see below)
 #
 # Same toolchain and flag set as amipkg, so a machine that can build that can
@@ -10,7 +11,12 @@
 
 CC      = m68k-amigaos-gcc
 CPU     = 68000
-CFLAGS  = -Os -fomit-frame-pointer -m$(CPU) -Wall -Wextra -D__amigaos__ -Ivendor/cgx
+ifeq ($(CPU),68080)
+OPT     = -O2
+else
+OPT     = -Os
+endif
+CFLAGS  = $(OPT) -fomit-frame-pointer -m$(CPU) -Wall -Wextra -D__amigaos__ -Ivendor/cgx
 # -lgcc after the objects: newlib's printf pulls in libgcc's 64-bit integer
 # helpers, which sit after libc in the default link order.
 LDFLAGS = -s -lgcc
