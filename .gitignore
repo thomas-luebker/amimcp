@@ -27,3 +27,6 @@ tools/amifleet/build/
 tools/amifleet/xcode/*.xcodeproj/
 tools/amifleet/xcode/amifleet/
 tools/amifleet/xcode/build/
+
+# amifleet scratch frames
+tools/amifleet/*.ppm

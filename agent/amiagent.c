@@ -69,6 +69,13 @@ typedef long ssize_t;
 #include "proto.h"
 #include "status.h"
 
+/* AmigaDOS version cookie. `Version amiagent` and Workbench's Information
+ * window both scan the binary for this string; without it Information shows
+ * "Version: ?" — which is what an icon-started agent looked like until now.
+ * `used` keeps -Os from discarding a string nothing references. */
+static const char __attribute__((used)) verstag[] =
+    "$VER: amiagent " AMIAGENT_VERSION " (23.8.2026)";
+
 #ifdef AMIAGENT_SSL
 #include <proto/amisslmaster.h>
 #include <proto/amissl.h>
