@@ -60,8 +60,29 @@ Update the catalog entry so `amipkg install amiagent` gets the new version.
 
 ### Aminet
 
-Upload `dist/amiagent-x.y.z.lha` and `dist/amiagent-x.y.z.readme` to
-`aminet.net/upload`.
+Two routes, and they are not equivalent.
+
+**The web form**, `aminet.net/upload` — upload `dist/amiagent-x.y.z.lha` and
+`dist/amiagent-x.y.z.readme`, and set the form's own replace field.
+
+**Anonymous FTP**, `ftp://main.aminet.net/new/`, email as the password — used
+for 0.13.0 on 2026-09-07 because the browser was unavailable:
+
+```sh
+for f in dist/amiagent-x.y.z.readme dist/amiagent-x.y.z.lha; do
+    curl --ftp-pasv --user "anonymous:thomas@amiga-imager.com" \
+         -T "$f" "ftp://main.aminet.net/new/$(basename "$f")"
+done
+```
+
+Both files, `.readme` first. FTP `226` means the transfer completed; the
+directory itself lists empty, because it is a write-only drop box.
+
+> **On the FTP path there is no replace field** — the `.readme` header is all
+> the moderator has. So the `Replaces:` line below is not belt-and-braces
+> there, it is the only thing standing between you and two versions sitting
+> side by side. **Whether Aminet honours it from an FTP upload is unconfirmed**
+> as of 0.13.0; check the search afterwards and record the answer here.
 
 > **Set the replace.** The `.readme` must carry a `Replaces:` line naming the
 > *previous* upload's full Aminet path, and the upload form's replace field
