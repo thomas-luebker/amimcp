@@ -78,11 +78,16 @@ done
 Both files, `.readme` first. FTP `226` means the transfer completed; the
 directory itself lists empty, because it is a write-only drop box.
 
-> **On the FTP path there is no replace field** — the `.readme` header is all
-> the moderator has. So the `Replaces:` line below is not belt-and-braces
-> there, it is the only thing standing between you and two versions sitting
-> side by side. **Whether Aminet honours it from an FTP upload is unconfirmed**
-> as of 0.13.0; check the search afterwards and record the answer here.
+> **ANSWERED, and the answer is no. USE THE FORM.** On the FTP path there is
+> no replace field, and the `.readme`'s `Replaces:` line **is not enough on its
+> own**: amiagent 0.13.0 went up by FTP on 2026-09-07 with a correct
+> `Replaces: comm/net/amiagent-0.12.0.lha`, cleared moderation on 09-08, and
+> **0.12.0 is still listed beside it** — precisely the two-versions-side-by-side
+> failure djbase reported on 10 Aug.
+>
+> So FTP is for when the form is unavailable, and it leaves you owing a
+> cleanup: ask Aminet to remove the superseded archive, and prefer the form
+> next time.
 
 > **Set the replace.** The `.readme` must carry a `Replaces:` line naming the
 > *previous* upload's full Aminet path, and the upload form's replace field
