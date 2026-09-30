@@ -1778,11 +1778,27 @@ static void input_post(struct InputEvent *ie)
     DoIO((struct IORequest *)g_inreq);
 }
 
+/* IECLASS_POINTERPOS is not in screen pixels: Intuition reads it in the
+ * display's finest raster, which is hires interlaced. A screen that is not in
+ * that mode therefore needs its coordinates scaled up, or the pointer lands
+ * short. The common case is a 640x256 hires Workbench, where Y has to be
+ * doubled: ask for y=170 and the pointer arrives at 85, so a click meant for
+ * the Ok button at the bottom of a requester quietly hits whatever sits
+ * halfway up it. A 320-wide lores screen needs the same for X.
+ *
+ * Measured on an A500 (ECS, PAL, 640x256 hires): X passed through unchanged,
+ * Y arrived halved. */
 static void input_move(WORD x, WORD y)
 {
     struct InputEvent ie;
+    struct Screen *scr = IntuitionBase->FirstScreen;    /* frontmost screen */
+    UWORD modes = scr ? (UWORD)scr->ViewPort.Modes : (UWORD)(HIRES | LACE);
+
+    if (!(modes & HIRES)) x = (WORD)(x * 2);
+    if (!(modes & LACE))  y = (WORD)(y * 2);
+
     ie_init(&ie);
-    ie.ie_Class = IECLASS_POINTERPOS;   /* absolute screen coordinates */
+    ie.ie_Class = IECLASS_POINTERPOS;   /* finest-raster coordinates */
     ie.ie_X = x;
     ie.ie_Y = y;
     input_post(&ie);
