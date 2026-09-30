@@ -41,6 +41,7 @@ typedef long ssize_t;
 #include <intuition/intuition.h>
 #include <intuition/intuitionbase.h>
 #include <graphics/gfxbase.h>
+#include <graphics/displayinfo.h>
 #include <cybergraphx/cybergraphics.h>
 #include <workbench/startup.h>
 #include <workbench/workbench.h>
@@ -1795,27 +1796,47 @@ static void input_post(struct InputEvent *ie)
     DoIO((struct IORequest *)g_inreq);
 }
 
-/* IECLASS_POINTERPOS is not in screen pixels: Intuition reads it in the
- * display's finest raster, which is hires interlaced. A screen that is not in
- * that mode therefore needs its coordinates scaled up, or the pointer lands
- * short. The common case is a 640x256 hires Workbench, where Y has to be
- * doubled: ask for y=170 and the pointer arrives at 85, so a click meant for
- * the Ok button at the bottom of a requester quietly hits whatever sits
- * halfway up it. A 320-wide lores screen needs the same for X.
- *
- * Measured on an A500 (ECS, PAL, 640x256 hires): X passed through unchanged,
- * Y arrived halved. */
+/* IECLASS_POINTERPOS is not in screen pixels but in the monitor's mouse
+ * ticks, so a warp has to be scaled by the frontmost screen's resolution over
+ * the monitor's MouseTicks, per axis. Measured on OS 3.2 (reported by mightym,
+ * PR #7): native monitors report MouseTicks 22,22 (hires interlaced), so
+ * unscaled a warp to y=170 on a 640x256 hires screen (Resolution 22,44)
+ * landed at 85, a lores screen (44,44) halved both axes and a SuperHires one
+ * (11,44) doubled X. A Picasso96 screen reports 11,11 for both and lands 1:1.
+ * Taking the ratio from the display database covers all of those, and any
+ * driver after them, without special cases. Measured after: all five land on
+ * the pixel asked for (SuperHires to the nearest even X, the pointer's own
+ * granularity there). */
 static void input_move(WORD x, WORD y)
 {
     struct InputEvent ie;
-    struct Screen *scr = IntuitionBase->FirstScreen;    /* frontmost screen */
-    UWORD modes = scr ? (UWORD)scr->ViewPort.Modes : (UWORD)(HIRES | LACE);
+    struct Screen *scr;
+    ULONG id = (ULONG)INVALID_ID;
+    struct DisplayInfo di;
+    struct MonitorInfo mi;
 
-    if (!(modes & HIRES)) x = (WORD)(x * 2);
-    if (!(modes & LACE))  y = (WORD)(y * 2);
+    /* Coordinates are relative to the screen, the warp to the display: a
+     * screen dragged down by 60 lines put every click 60 lines high. Its
+     * LeftEdge/TopEdge are in its own pixels, so add them before scaling. */
+    Forbid();
+    scr = IntuitionBase->FirstScreen;   /* the frontmost screen */
+    if (scr) {
+        id = GetVPModeID(&scr->ViewPort);
+        x = (WORD)(x + scr->LeftEdge);
+        y = (WORD)(y + scr->TopEdge);
+    }
+    Permit();
+
+    if (id != (ULONG)INVALID_ID
+        && GetDisplayInfoData(NULL, (UBYTE *)&di, sizeof di, DTAG_DISP, id) > 0
+        && GetDisplayInfoData(NULL, (UBYTE *)&mi, sizeof mi, DTAG_MNTR, id) > 0
+        && mi.MouseTicks.x > 0 && mi.MouseTicks.y > 0) {
+        x = (WORD)((LONG)x * di.Resolution.x / mi.MouseTicks.x);
+        y = (WORD)((LONG)y * di.Resolution.y / mi.MouseTicks.y);
+    }
 
     ie_init(&ie);
-    ie.ie_Class = IECLASS_POINTERPOS;   /* finest-raster coordinates */
+    ie.ie_Class = IECLASS_POINTERPOS;   /* monitor mouse ticks, scaled above */
     ie.ie_X = x;
     ie.ie_Y = y;
     input_post(&ie);
