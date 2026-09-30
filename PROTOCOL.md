@@ -61,7 +61,7 @@ exception: it precedes the real request on the same connection.
 | 0x11 | `HELLO`| Driver description, text             | *(empty)* |
 | 0x12 | `AREXX`| ARexx program source, text          | `rc` (u32) + RESULT string |
 | 0x13 | `REXXPORTS` | *(empty)*                       | Public port names, one per line |
-| 0x14 | `GETRANGE` | `offset` (u32) + `length` (u32) + path | `length` file bytes |
+| 0x14 | `GETRANGE` | `offset` (u32) + `length` (u32) + path | up to `length` file bytes |
 
 Text payloads are **not** NUL-terminated; the frame length delimits them.
 
@@ -77,7 +77,12 @@ is how the fleet drives ARexx-aware apps (editors, DOpus, comms, players).
 ports `AREXX` can `ADDRESS`, so a caller can discover what is scriptable right
 now. `GETRANGE` is `GET` with an `offset`+`length` prefix, letting a client
 stream a file past the 16 MiB frame limit in pieces (the download counterpart to
-chunked upload via `Join`).
+chunked upload via `Join`). A range that runs past the end of the file is
+clamped: the reply carries only the bytes that exist, so **a reply shorter than
+`length` means end of file** (and an `offset` exactly at the end gets an empty
+reply). Agents before 0.13.2 announced the full `length` and then sent less,
+leaving the client waiting mid-frame; size the file from `LIST` first if you
+must talk to one of those.
 
 ## Statuses (response `code`)
 

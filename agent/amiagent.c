@@ -907,6 +907,20 @@ static int do_getrange(int sock, const UBYTE *payload, ULONG len)
     if (Seek(fh, (LONG)offset, OFFSET_BEGINNING) < 0) {
         Close(fh); return send_err(sock, "seek past end of file");
     }
+    /* The header promises `length` bytes, so it must not promise more than
+     * the file holds: a range running past EOF used to announce the full
+     * request, send what there was and leave the client waiting mid-frame
+     * for the rest. Clamp it — a short frame then means end of file, which
+     * is what a chunked reader expects. Seek() returns the previous
+     * position, so going to the end and back yields the size. */
+    {
+        LONG size;
+        Seek(fh, 0, OFFSET_END);
+        size = Seek(fh, (LONG)offset, OFFSET_BEGINNING);
+        if (size < 0) { Close(fh); return send_err(sock, "cannot size that file"); }
+        if (offset >= (ULONG)size) length = 0;
+        else if (length > (ULONG)size - offset) length = (ULONG)size - offset;
+    }
     say("getrange: %lu bytes at %lu\n", (unsigned long)length, (unsigned long)offset);
     if (!send_hdr(sock, ST_OK, length)) { Close(fh); return 0; }
     ok = pump(sock, fh, length);
@@ -1325,10 +1339,13 @@ static int grab_chunky(int sock, struct Screen *scr,
 
     /* ReadPixelArray8 wants rows padded out to a multiple of 16 pixels. */
     stride = ((ULONG)w + 15UL) & ~15UL;
-    pix = (UBYTE *)AllocVec(stride * (ULONG)h, MEMF_ANY);
+    pix = (UBYTE *)AllocVec(stride * (ULONG)h, MEMF_ANY | MEMF_CLEAR);
     if (!pix) return send_err(sock, "not enough memory for the screen buffer");
 
-    tempbm = AllocBitMap(stride, 1, 8, 0, NULL);
+    /* BMF_CLEAR is not optional: ReadPixelArray8 fills only as many planes
+     * of the temp bitmap as the screen has, and on a screen shallower than 8
+     * whatever sat in the rest came back as the high bits of every pixel. */
+    tempbm = AllocBitMap(stride, 1, 8, BMF_CLEAR, NULL);
     if (!tempbm) { FreeVec(pix); return send_err(sock, "not enough memory for the temp bitmap"); }
 
     temprp = *rp;
@@ -3018,11 +3035,9 @@ done:
 
 static int ssl_init(const char *pem)
 {
-    /* A daemon must never pop a DOS requester. AmiSSL's init touches the
-     * `AmiSSL:` assign; if it is missing, an "insert volume AmiSSL" requester
-     * would otherwise block the whole agent forever. -1 makes that access fail
-     * immediately instead, so we fall back to plain cleanly. */
-    ((struct Process *)FindTask(NULL))->pr_WindowPtr = (APTR)-1;
+    /* AmiSSL's init touches the `AmiSSL:` assign. If it is missing, main()
+     * has already set pr_WindowPtr to -1, so that access fails at once rather
+     * than putting up "insert volume AmiSSL", and we fall back to plain. */
 
     if (!(AmiSSLMasterBase = OpenLibrary("amisslmaster.library", AMISSLMASTER_MIN_VERSION)))
         return 0;
@@ -3157,6 +3172,19 @@ int main(void)
 #else
     (void)tlsport;
 #endif
+    struct Process *self = (struct Process *)FindTask(NULL);
+    APTR oldwinptr = self->pr_WindowPtr;
+
+    /* A daemon must never pop a DOS requester: every LIST, GET, PUT and SHOT
+     * hands a client-supplied path to Lock()/Open() on this process, and one
+     * naming a volume that is not mounted would put up "insert volume" and
+     * park the accept loop — and with it the ARexx QUIT — until somebody
+     * clicks Cancel at the machine. -1 makes that access fail at once. It
+     * has to be here rather than in ssl_init(), which a plain build never
+     * runs. The command process inherits it, so a shell command that names a
+     * missing volume fails instead of waiting too. Restored on the way out:
+     * started from a Shell, this is that Shell's own process. */
+    self->pr_WindowPtr = (APTR)-1;
 
     g_wbs = _WBenchMsg;
     if (g_wbs) {
@@ -3194,6 +3222,7 @@ int main(void)
         rda = ReadArgs((STRPTR)TEMPLATE, (LONG *)&a, NULL);
         if (!rda) {
             PrintFault(IoErr(), (STRPTR)"amiagent");
+            self->pr_WindowPtr = oldwinptr;
             return RETURN_FAIL;
         }
         if (a.port) port = (int)*a.port;
@@ -3361,5 +3390,6 @@ out:
     if (GfxBase) CloseLibrary((struct Library *)GfxBase);
     if (IntuitionBase) CloseLibrary((struct Library *)IntuitionBase);
 #endif
+    self->pr_WindowPtr = oldwinptr;
     return rc;
 }

@@ -561,4 +561,13 @@ class Amiga:
             raise AmigaUnreachable(
                 f"screenshot truncated: got {len(pixels)} of {expected} pixel bytes"
             )
+        if fmt == SHOT_CHUNKY and ncolors:
+            # An index past the palette is wrong by definition. Agents before
+            # 0.13.2 left the unused planes of their temp bitmap uncleared, so a
+            # planar screen shallower than 8 came back with noise in the high
+            # bits of every pixel; masking here fixes those without touching
+            # the Amiga.
+            mask = ncolors - 1
+            if ncolors & mask == 0:
+                pixels = pixels.translate(bytes(i & mask for i in range(256)))
         return Screenshot(width=width, height=height, palette=palette, pixels=pixels)

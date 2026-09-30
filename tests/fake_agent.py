@@ -27,7 +27,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "server"))
 
 from amiga import (  # noqa: E402
-    CMD_AUTH, CMD_BREAK, CMD_EXEC, CMD_GET, CMD_INFO, CMD_INPUT, CMD_LIST,
+    CMD_AUTH, CMD_BREAK, CMD_EXEC, CMD_GET, CMD_GETRANGE, CMD_INFO, CMD_INPUT, CMD_LIST,
     CMD_HASH, CMD_PING, CMD_POINTER, CMD_PUT, CMD_SCREENS, CMD_SHOT, HDRLEN,
     IN_BUTTON, IN_CLICK, IN_HOME, IN_KEY, IN_MOVE, IN_RMOVE, IN_SCRIPT,
     INS_WAIT, IN_TEXT, MAGIC, SHOT_CHUNKY, SHOT_RGB24, ST_AUTH, ST_ERR, ST_OK,
@@ -37,6 +37,9 @@ from amiga import (  # noqa: E402
 # what would have reached input.device.
 INPUT_LOG: list[tuple] = []
 TRUECOLOR = False
+# Set the unused high bits of every chunky pixel, as an agent before 0.13.2
+# did on a planar screen shallower than 8 (uncleared temp bitmap planes).
+SHOT_NOISE = False
 
 ROOT = "/tmp/fakeamiga"
 TOKEN = ""
@@ -117,6 +120,8 @@ def fake_screenshot(region=None) -> bytes:
         for x in range(w):
             # keyed off absolute screen position, so a region really is a crop
             pixels[y * w + x] = (((x + ox) // 20) + ((y + oy) // 25)) % ncolors
+            if SHOT_NOISE:
+                pixels[y * w + x] |= 0xA0 if x % 3 else 0xF0
     hdr = struct.pack(">BBHHH", SHOT_CHUNKY, 0, w, h, ncolors)
     return hdr + bytes(palette) + bytes(pixels)
 
@@ -358,6 +363,13 @@ class Handler(socketserver.BaseRequestHandler):
             elif code == CMD_GET:
                 with open(to_host(body.decode("latin-1")), "rb") as fh:
                     self.reply(ST_OK, fh.read())
+            elif code == CMD_GETRANGE:
+                # A range running past EOF is clamped, so a short frame means
+                # end of file — the header never promises bytes that aren't there.
+                offset, length = struct.unpack(">II", body[:8])
+                with open(to_host(body[8:].decode("latin-1")), "rb") as fh:
+                    fh.seek(offset)
+                    self.reply(ST_OK, fh.read(length))
             elif code == CMD_PUT:
                 (plen,) = struct.unpack(">H", body[:2])
                 path = body[2 : 2 + plen].decode("latin-1")

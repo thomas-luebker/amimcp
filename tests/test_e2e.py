@@ -93,6 +93,13 @@ class TestWireProtocol(Base):
         self.ami.write_file("Work:big.bin", payload)
         self.assertEqual(self.ami.read_file("Work:big.bin"), payload)
 
+    def test_read_range_past_eof_is_short_not_a_hang(self):
+        payload = bytes(range(256)) * 16  # 4096 bytes
+        self.ami.write_file("Work:range.bin", payload)
+        self.assertEqual(self.ami.read_range("Work:range.bin", 1000, 100), payload[1000:1100])
+        self.assertEqual(self.ami.read_range("Work:range.bin", 4000, 8192), payload[4000:])
+        self.assertEqual(self.ami.read_range("Work:range.bin", 4096, 512), b"")
+
     def test_list_dir_sorts_dirs_first(self):
         entries = self.ami.list_dir("SYS:")
         names = [e.name for e in entries]
@@ -120,6 +127,15 @@ class TestWireProtocol(Base):
         self.assertEqual((shot.width, shot.height), (320, 200))
         self.assertEqual(len(shot.palette), 16)
         self.assertEqual(len(shot.pixels), 320 * 200)
+
+    def test_screenshot_masks_indices_past_the_palette(self):
+        fake_agent.SHOT_NOISE = True
+        try:
+            shot = self.ami.screenshot()
+        finally:
+            fake_agent.SHOT_NOISE = False
+        self.assertLess(max(shot.pixels), len(shot.palette))
+        self.assertEqual(shot.pixels, self.ami.screenshot().pixels)
 
     def test_unreachable_host_message_is_actionable(self):
         dead = Amiga("127.0.0.1", free_port(), timeout=2)
