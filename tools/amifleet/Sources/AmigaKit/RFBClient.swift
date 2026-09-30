@@ -8,7 +8,8 @@
 // has to do anything clever. Blocking BSD sockets, the same idiom as
 // AmigaWire: connect, read/write a byte stream, close.
 //
-// Threading: one connection, full-duplex. A reader loop calls `pumpOnce`; input
+// Threading: one connection, full-duplex. A reader loop calls `pumpStreaming`
+// (or `pumpOnce` + its own `requestUpdate`); input
 // (`sendPointer`/`sendKey`) may be called from another thread — all writes take
 // `sendLock`, and TCP lets us write while a recv blocks.
 
@@ -168,8 +169,31 @@ public final class RFBClient: @unchecked Sendable {
 
     // ---- the pump --------------------------------------------------------
 
+    /// Update pacing. AmiVNC answers an incremental FramebufferUpdateRequest at
+    /// once even when nothing changed, so "request the next frame the moment one
+    /// arrives" is a tight request/reply loop: ~37 round trips/s against the
+    /// real AmiVNC on the PiStorm, which starved its agent and crashed the
+    /// machine ~25 s in (amifleet68, 2026-09-30); ~24,000/s against a local
+    /// fake. Never ask sooner than `minRequestInterval` after the previous
+    /// update, and back off to `idleRequestInterval` when it had no rectangles.
+    /// Input (`sendPointer`/`sendKey`) is not paced — it goes out at once.
+    public static let minRequestInterval: TimeInterval = 0.100
+    public static let idleRequestInterval: TimeInterval = 0.250
+
+    /// Rectangle count of the most recent FramebufferUpdate (0 = nothing changed).
+    public private(set) var lastUpdateRects = 0
+    /// When the next incremental request is due (monotonic seconds), or nil
+    /// when one is already outstanding / none has been scheduled yet.
+    private var nextRequestAt: TimeInterval?
+
+    private static func now() -> TimeInterval {
+        TimeInterval(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1e9
+    }
+
     /// Ask the server for the next frame. Incremental after the first full one.
+    /// Unpaced: prefer `pumpStreaming`, which schedules incremental requests.
     public func requestUpdate(incremental: Bool) throws {
+        nextRequestAt = nil
         var msg = Data([3, incremental ? 1 : 0])     // FramebufferUpdateRequest
         for v in [0, 0, width, height] {             // x, y, w, h
             msg.append(UInt8(v >> 8)); msg.append(UInt8(v & 0xFF))
@@ -191,6 +215,25 @@ public final class RFBClient: @unchecked Sendable {
         }
     }
 
+    /// The streaming pump: like `pumpOnce`, but also sends the incremental
+    /// FramebufferUpdateRequests itself, paced (see `minRequestInterval`).
+    /// Call `requestUpdate(incremental: false)` once first, then call this in a
+    /// loop. Returns a frame when an update arrived, nil after `timeout`.
+    public func pumpStreaming(timeout: TimeInterval) throws -> RFBFrame? {
+        let deadline = Self.now() + timeout
+        while true {
+            var t = Self.now()
+            if let due = nextRequestAt, t >= due {
+                try requestUpdate(incremental: true)
+                t = Self.now()
+            }
+            var wait = deadline - t
+            if let due = nextRequestAt { wait = min(wait, due - t) }
+            if let frame = try pumpOnce(timeout: max(0, wait)) { return frame }
+            if Self.now() >= deadline { return nil }
+        }
+    }
+
     /// A snapshot of the current framebuffer (thread-safe copy of the array).
     public func snapshot() -> RFBFrame {
         RFBFrame(width: width, height: height, rgba: fb)
@@ -209,6 +252,9 @@ public final class RFBClient: @unchecked Sendable {
             default: throw RFBError.proto("unsupported encoding \(enc)")
             }
         }
+        lastUpdateRects = rects
+        nextRequestAt = Self.now() + (rects > 0 ? Self.minRequestInterval
+                                                : Self.idleRequestInterval)
         return snapshot()
     }
 
@@ -401,7 +447,7 @@ public final class RFBClient: @unchecked Sendable {
     /// Wait up to `timeout` for the next message-type byte; nil if none arrived.
     private func recvTypeByte(_ timeout: TimeInterval) throws -> UInt8? {
         var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-        let ready = poll(&pfd, 1, Int32(timeout * 1000))
+        let ready = poll(&pfd, 1, Int32((timeout * 1000).rounded(.up)))
         if ready == 0 { return nil }
         guard ready == 1 else { throw RFBError.unreachable("poll: \(errnoText())") }
         var b: UInt8 = 0

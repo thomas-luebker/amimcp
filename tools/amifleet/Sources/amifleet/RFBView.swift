@@ -97,11 +97,15 @@ final class RFBSession: ObservableObject {
                 self.phase = .streaming
             }
             try client.requestUpdate(incremental: false)
+            // pumpStreaming paces the incremental requests (>= 100 ms apart,
+            // 250 ms after an empty update) — an unpaced request-on-arrival
+            // loop against AmiVNC crashed a PiStorm. An empty update changes
+            // nothing on screen, so it is not re-rendered.
             while !Task.isCancelled {
-                if let frame = try client.pumpOnce(timeout: 0.5) {
+                if let frame = try client.pumpStreaming(timeout: 0.5),
+                   client.lastUpdateRects > 0 {
                     let img = Self.makeImage(frame)
                     await MainActor.run { self.image = img }
-                    try client.requestUpdate(incremental: true)
                 }
             }
         } catch {

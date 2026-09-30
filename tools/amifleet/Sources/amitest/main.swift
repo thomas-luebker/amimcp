@@ -107,10 +107,9 @@ Task {
             // Pump incremental frames for a few seconds; count what arrives.
             var frames = 0; var last: RFBFrame?
             try rfb.requestUpdate(incremental: true)
-            for _ in 0..<20 {
-                if let f = try rfb.pumpOnce(timeout: 0.5) {
+            for _ in 0..<20 {                                      // paced, like the GUI
+                if let f = try rfb.pumpStreaming(timeout: 0.5) {
                     frames += 1; last = f
-                    try rfb.requestUpdate(incremental: true)
                 }
             }
             rfb.close()
