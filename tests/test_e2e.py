@@ -100,6 +100,17 @@ class TestWireProtocol(Base):
         self.assertIn("C", names)
         self.assertTrue(entries[0].is_dir)
 
+    def test_list_soft_link_is_not_a_dir(self):
+        # A soft link to a directory must not look like one (LIST type L), or a
+        # client that recurses into directories descends into the link.
+        os.makedirs(os.path.join(self.root, "linktest", "real"), exist_ok=True)
+        os.symlink("real", os.path.join(self.root, "linktest", "alias"))
+        entries = {e.name: e for e in self.ami.list_dir("SYS:linktest")}
+        self.assertTrue(entries["real"].is_dir)
+        self.assertFalse(entries["real"].is_link)
+        self.assertFalse(entries["alias"].is_dir)
+        self.assertTrue(entries["alias"].is_link)
+
     def test_list_file_raises(self):
         with self.assertRaises(AmigaError):
             self.ami.list_dir("S:Startup-Sequence")

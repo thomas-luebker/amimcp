@@ -384,11 +384,12 @@ class Handler(socketserver.BaseRequestHandler):
         out = []
         for name in sorted(os.listdir(host)):
             full = os.path.join(host, name)
-            is_dir = os.path.isdir(full)
-            size = 0 if is_dir else os.path.getsize(full)
-            out.append(
-                f"{'D' if is_dir else 'F'}\t{size}\t----rwed\t01-Jan-99 00:00:00\t{name}"
-            )
+            # Like the real agent: a symlink is L whatever it points at.
+            is_link = os.path.islink(full)
+            is_dir = not is_link and os.path.isdir(full)
+            size = 0 if is_dir or is_link else os.path.getsize(full)
+            kind = "L" if is_link else "D" if is_dir else "F"
+            out.append(f"{kind}\t{size}\t----rwed\t01-Jan-99 00:00:00\t{name}")
         return ("\n".join(out) + "\n").encode("latin-1") if out else b""
 
 

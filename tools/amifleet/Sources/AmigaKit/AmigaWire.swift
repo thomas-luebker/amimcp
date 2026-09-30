@@ -40,6 +40,9 @@ public struct AmigaScreenInfo {
 public struct AmigaDirEntry: Identifiable, Hashable, Sendable {
     public var id: String { name }
     public let isDir: Bool
+    /// A soft link (LIST type L, agents newer than 0.13.0). Never also isDir,
+    /// even when it points at a directory — so nothing walks into it.
+    public let isLink: Bool
     public let size: Int
     public let protection: String
     public let date: String
@@ -357,6 +360,7 @@ extension AmigaClient {
             let parts = line.split(separator: "\t", maxSplits: 4, omittingEmptySubsequences: false)
             guard parts.count == 5 else { continue }
             out.append(AmigaDirEntry(isDir: parts[0] == "D",
+                                     isLink: parts[0] == "L",
                                      size: Int(parts[1]) ?? 0,
                                      protection: String(parts[2]),
                                      date: String(parts[3]),

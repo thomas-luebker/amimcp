@@ -163,7 +163,7 @@ private struct FileRow: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Text(entry.isDir ? "📁" : "📄").font(.system(size: 10))
+            Text(entry.isDir ? "📁" : entry.isLink ? "🔗" : "📄").font(.system(size: 10))
             Text(entry.name).font(WB.topaz(10)).foregroundColor(.white).lineLimit(1)
             Spacer(minLength: 0)
             if entry.isDir {

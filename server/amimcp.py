@@ -601,7 +601,7 @@ def tool_list_dir(ami: Amiga, args: dict) -> list[dict]:
     lines = [f"{path} — {len(entries)} entries", ""]
     width = max(len(e.name) for e in entries)
     for e in entries:
-        size = "(dir)" if e.is_dir else str(e.size)
+        size = "(dir)" if e.is_dir else "(link)" if e.is_link else str(e.size)
         lines.append(f"{e.name:<{width}}  {size:>10}  {e.protection}  {e.date}")
     return [{"type": "text", "text": "\n".join(lines)}]
 

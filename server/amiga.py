@@ -93,6 +93,9 @@ class DirEntry:
     protection: str
     date: str
     name: str
+    # A soft link (LIST type L, agents newer than 0.13.0): is_dir is False even
+    # when it points at a directory, so a recursive walk does not follow it.
+    is_link: bool = False
 
 
 @dataclass
@@ -289,6 +292,7 @@ class Amiga:
                     protection=prot,
                     date=date,
                     name=name,
+                    is_link=(kind == "L"),
                 )
             )
         entries.sort(key=lambda e: (not e.is_dir, e.name.lower()))

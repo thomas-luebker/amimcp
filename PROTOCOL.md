@@ -160,7 +160,17 @@ One line per entry, `\n`-terminated, fields separated by tabs:
 type <TAB> size <TAB> protection <TAB> date <TAB> name
 ```
 
-`type` is `D` for a directory or `F` for a file. `protection` is the AmigaDOS
+`type` is `D` for a directory, `F` for a file, or `L` for a soft link
+(`fib_DirEntryType == ST_SOFTLINK`; agents newer than 0.13.0). A soft link is reported as
+`L` whatever it points at — `ExNext()` does not say, and resolving every link
+while listing would cost a lock per entry — so a client that recurses into
+directories must not descend into `L` entries. Reading an `L` entry with `GET`
+follows the link, so a link to a file downloads the target; a link to a
+directory fails there like any directory would. Its `size` is not meaningful.
+Hard links are not marked: DOS presents them as the entry itself, so a hard
+link to a directory (`ST_LINKDIR`) is `D` and one to a file (`ST_LINKFILE`) is
+`F`. Agents up to 0.13.0 reported soft links as `D`. Clients should treat any
+letter other than `D` as "not a directory". `protection` is the AmigaDOS
 bit string (`hsparwed`). `date` is `DD-MMM-YY HH:MM:SS`. Names may contain
 spaces — that is why `name` is last and why the separator is a tab, which
 AmigaDOS filenames cannot contain.

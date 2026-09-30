@@ -995,6 +995,19 @@ static void fmt_protection(ULONG prot, char *out)
     out[8] = '\0';
 }
 
+/* LIST type letter for an ExNext() entry. fib_DirEntryType is > 0 for
+ * directories, < 0 for files - but ST_SOFTLINK (3) is positive too, whatever
+ * the link points at, so `> 0 ? 'D'` reported every soft link as a directory
+ * (RAM:Disk.info, a link to ENVARC:Sys/def_RAM.info, came back as D). A client
+ * that recurses into D entries would descend into links. Soft links get their
+ * own letter, L. Hard links are the entry itself as far as DOS is concerned:
+ * ST_LINKDIR (4) stays D and ST_LINKFILE (-4) stays F. */
+static char list_type(LONG t)
+{
+    if (t == ST_SOFTLINK) return 'L';
+    return t > 0 ? 'D' : 'F';
+}
+
 static int do_list(int sock, const UBYTE *payload, ULONG len)
 {
     char *path = dup_cstr(payload, len);
@@ -1045,7 +1058,7 @@ static int do_list(int sock, const UBYTE *payload, ULONG len)
         if (!DateToStr(&dt)) { sdate[0] = '\0'; stime[0] = '\0'; }
 
         sprintf(line, "%c\t%ld\t%s\t%s %s\t%s\n",
-                fib->fib_DirEntryType > 0 ? 'D' : 'F',
+                list_type(fib->fib_DirEntryType),
                 (long)fib->fib_Size, prot, sdate, stime, fib->fib_FileName);
         if (!buf_str(&b, line)) { ok = 0; break; }
     }
