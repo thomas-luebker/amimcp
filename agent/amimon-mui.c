@@ -45,7 +45,7 @@ struct Library *MUIMasterBase = NULL;
 struct Library *UtilityBase = NULL;    /* MUI notification tags use utility */
 
 static const char verstag[] __attribute__((used)) =
-    "$VER: amimon-mui " AMIAGENT_VERSION " (9.8.2026)";
+    "$VER: amimon-mui " AMIAGENT_VERSION " (30.9.2026)";
 
 #ifndef MAKE_ID
 #define MAKE_ID(a,b,c,d) ((ULONG)(a)<<24 | (ULONG)(b)<<16 | (ULONG)(c)<<8 | (ULONG)(d))
