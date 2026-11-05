@@ -36,6 +36,10 @@ typedef long ssize_t;
 #include <dos/datetime.h>
 #include <dos/dosextens.h>
 #include <exec/io.h>
+#include <exec/errors.h>
+#include <devices/trackdisk.h>
+#include <devices/newstyle.h>
+#include <dos/filehandler.h>
 #include <devices/input.h>
 #include <devices/inputevent.h>
 #include <intuition/intuition.h>
@@ -75,7 +79,7 @@ typedef long ssize_t;
  * "Version: ?" — which is what an icon-started agent looked like until now.
  * `used` keeps -Os from discarding a string nothing references. */
 static const char __attribute__((used)) verstag[] =
-    "$VER: amiagent " AMIAGENT_VERSION " (3.10.2026)";
+    "$VER: amiagent " AMIAGENT_VERSION " (5.11.2026)";
 
 #ifdef AMIAGENT_SSL
 #include <proto/amisslmaster.h>
@@ -305,6 +309,25 @@ static int sock_readable(int sock, long secs)
     return FD_ISSET(sock, &rd) ? 1 : 0;
 }
 
+/* Wait until `sock` can take more data: 1 ready, 0 timed out, -1 on Ctrl-C
+ * or error. */
+static int sock_writable(int sock, long secs)
+{
+    fd_set wr;
+    struct timeval tv;
+    ULONG sigs = SIGBREAKF_CTRL_C;
+    LONG n;
+
+    FD_ZERO(&wr);
+    FD_SET(sock, &wr);
+    tv.tv_sec = secs;
+    tv.tv_usec = 0;
+    n = WaitSelect(sock + 1, NULL, &wr, NULL, &tv, &sigs);
+    if (sigs & SIGBREAKF_CTRL_C) return -1;
+    if (n <= 0) return n < 0 ? -1 : 0;
+    return FD_ISSET(sock, &wr) ? 1 : 0;
+}
+
 /* Read exactly len bytes. Returns 1 on success, 0 on EOF/error/break. */
 static int recv_all(int sock, UBYTE *buf, ULONG len)
 {
@@ -348,7 +371,13 @@ static int send_all(int sock, const UBYTE *buf, ULONG len)
     }
 #endif
     while (len) {
-        long put = send(sock, (char *)buf, (int)(len > 0x7000 ? 0x7000 : len), 0);
+        long put;
+        /* Never block for good on a client that stopped reading: a lost FIN
+         * or a stalled link would otherwise park this single-threaded agent
+         * in send() and every later connection with it (seen on the A4000
+         * an hour into a RAWREAD run, 2026-11-05). */
+        if (sock_writable(sock, 60) <= 0) return 0;
+        put = send(sock, (char *)buf, (int)(len > 0x7000 ? 0x7000 : len), 0);
         if (put <= 0) return 0;
         buf += put;
         len -= (ULONG)put;
@@ -927,6 +956,250 @@ static int do_getrange(int sock, const UBYTE *payload, ULONG len)
     ok = pump(sock, fh, length);
     Close(fh);
     return ok;
+}
+
+/* ------------------------------------------------------------------ *
+ * DEVICES / RAWREAD: the disks themselves, read-only
+ *
+ * Amiga Imager images a disk of a running Amiga over the network: DEVICES
+ * says which exec device and unit sit behind each mounted drive, RAWREAD
+ * reads block ranges from one. Nothing here ever writes to a device.
+ * ------------------------------------------------------------------ */
+
+#define MAX_DRIVES 48
+
+struct drive_rec {
+    char  dosname[32];
+    char  device[64];
+    ULONG unit, flags;
+    ULONG blockbytes, surfaces, bpt, lowcyl, highcyl, dostype, bufmem, mask, maxtx;
+    LONG  bootpri;
+};
+
+/* A FileSysStartupMsg pointer is only one when it points at real memory: a
+ * handler such as CON: or RAM: keeps a small integer in dol_Startup. */
+static struct FileSysStartupMsg *startup_of(struct DosList *dl)
+{
+    ULONG raw = (ULONG)dl->dol_misc.dol_handler.dol_Startup;
+    struct FileSysStartupMsg *fssm;
+    if (raw < 0x100) return NULL;
+    fssm = (struct FileSysStartupMsg *)BADDR(raw);
+    if (!TypeOfMem(fssm)) return NULL;
+    if (!fssm->fssm_Device || !TypeOfMem(BADDR(fssm->fssm_Device))) return NULL;
+    if (!fssm->fssm_Environ || !TypeOfMem(BADDR(fssm->fssm_Environ))) return NULL;
+    return fssm;
+}
+
+static void bstr_copy(char *dst, ULONG cap, BSTR b)
+{
+    const UBYTE *p = (const UBYTE *)BADDR(b);
+    ULONG n = p[0];
+    if (n > cap - 1) n = cap - 1;
+    CopyMem((APTR)(p + 1), dst, n);
+    dst[n] = '\0';
+    /* Some mountlists count the terminating NUL in the length. */
+    while (n && dst[n - 1] == '\0') n--;
+    dst[n] = '\0';
+}
+
+/* Every mounted drive with a FileSysStartupMsg. Collected under the DosList
+ * lock and handed back, so no device is opened while the list is locked. */
+static int collect_drives(struct drive_rec *out, int max)
+{
+    struct DosList *dl;
+    int n = 0;
+    dl = LockDosList(LDF_DEVICES | LDF_READ);
+    while ((dl = NextDosEntry(dl, LDF_DEVICES)) && n < max) {
+        struct FileSysStartupMsg *fssm = startup_of(dl);
+        struct DosEnvec *de;
+        struct drive_rec *r = &out[n];
+        ULONG size;
+        if (!fssm) continue;
+        de = (struct DosEnvec *)BADDR(fssm->fssm_Environ);
+        size = de->de_TableSize;
+        memset(r, 0, sizeof *r);
+        bstr_copy(r->dosname, sizeof r->dosname, dl->dol_Name);
+        bstr_copy(r->device, sizeof r->device, fssm->fssm_Device);
+        r->unit = fssm->fssm_Unit;
+        r->flags = fssm->fssm_Flags;
+        r->blockbytes = de->de_SizeBlock * 4;
+        r->surfaces = de->de_Surfaces;
+        r->bpt = de->de_BlocksPerTrack;
+        r->lowcyl = de->de_LowCyl;
+        r->highcyl = de->de_HighCyl;
+        r->bufmem = size >= DE_BUFMEMTYPE ? de->de_BufMemType : MEMF_PUBLIC;
+        r->maxtx = size >= DE_MAXTRANSFER ? de->de_MaxTransfer : 0;
+        r->mask = size >= DE_MASK ? de->de_Mask : 0xFFFFFFFFUL;
+        r->bootpri = size >= DE_BOOTPRI ? de->de_BootPri : 0;
+        r->dostype = size >= DE_DOSTYPE ? de->de_DosType : 0;
+        n++;
+    }
+    UnLockDosList(LDF_DEVICES | LDF_READ);
+    return n;
+}
+
+struct rawdev {
+    struct MsgPort *port;
+    struct IOStdReq *io;
+    int open;
+};
+
+static int rawdev_open(struct rawdev *d, const char *device, ULONG unit, ULONG flags)
+{
+    memset(d, 0, sizeof *d);
+    if (!(d->port = CreateMsgPort())) return 0;
+    if (!(d->io = (struct IOStdReq *)CreateIORequest(d->port, sizeof(struct IOStdReq)))) return 0;
+    if (OpenDevice((STRPTR)device, unit, (struct IORequest *)d->io, flags) != 0) return 0;
+    d->open = 1;
+    return 1;
+}
+
+static void rawdev_close(struct rawdev *d)
+{
+    if (d->open) CloseDevice((struct IORequest *)d->io);
+    if (d->io) DeleteIORequest((struct IORequest *)d->io);
+    if (d->port) DeleteMsgPort(d->port);
+    memset(d, 0, sizeof *d);
+}
+
+static int do_devices(int sock)
+{
+    static struct drive_rec drives[MAX_DRIVES];
+    struct buf b;
+    char line[320];
+    int n, i, j, ok = 1;
+
+    buf_init(&b);
+    n = collect_drives(drives, MAX_DRIVES);
+    for (i = 0; i < n; i++) {
+        struct drive_rec *r = &drives[i];
+        sprintf(line, "P\t%s\t%s\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%08lx\t%ld\t%lx\t%08lx\t%lx\n",
+                r->dosname, r->device, (unsigned long)r->unit, (unsigned long)r->flags,
+                (unsigned long)r->blockbytes, (unsigned long)r->surfaces, (unsigned long)r->bpt,
+                (unsigned long)r->lowcyl, (unsigned long)r->highcyl, (unsigned long)r->dostype,
+                (long)r->bootpri, (unsigned long)r->bufmem, (unsigned long)r->mask,
+                (unsigned long)r->maxtx);
+        ok &= buf_str(&b, line);
+    }
+    /* One geometry per distinct device+unit. */
+    for (i = 0; i < n; i++) {
+        struct rawdev d;
+        struct DriveGeometry g;
+        int seen = 0;
+        for (j = 0; j < i; j++)
+            if (drives[j].unit == drives[i].unit && !strcmp(drives[j].device, drives[i].device)) seen = 1;
+        if (seen) continue;
+        memset(&g, 0, sizeof g);
+        if (rawdev_open(&d, drives[i].device, drives[i].unit, drives[i].flags)) {
+            d.io->io_Command = TD_GETGEOMETRY;
+            d.io->io_Data = &g;
+            d.io->io_Length = sizeof g;
+            if (DoIO((struct IORequest *)d.io) != 0) memset(&g, 0, sizeof g);
+        }
+        rawdev_close(&d);
+        sprintf(line, "U\t%s\t%lu\t%lu\t%lu\t%lu\n", drives[i].device,
+                (unsigned long)drives[i].unit, (unsigned long)drives[i].flags,
+                (unsigned long)g.dg_SectorSize, (unsigned long)g.dg_TotalSectors);
+        ok &= buf_str(&b, line);
+    }
+    if (!ok) { buf_free(&b); return send_err(sock, "out of memory"); }
+    ok = send_resp(sock, ST_OK, b.p, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+/* The unit's buffer rules, from its mounted partitions: the strictest
+ * MaxTransfer, the memory type and the DMA mask its filesystems use. A unit
+ * with no mounted partition gets public memory and 64 KiB transfers. */
+static void unit_rules(const char *device, ULONG unit, ULONG *memtype, ULONG *mask, ULONG *maxtx)
+{
+    static struct drive_rec drives[MAX_DRIVES];
+    int n = collect_drives(drives, MAX_DRIVES), i, found = 0;
+    *memtype = MEMF_PUBLIC; *mask = 0xFFFFFFFFUL; *maxtx = 0x10000;
+    for (i = 0; i < n; i++) {
+        if (drives[i].unit != unit || strcmp(drives[i].device, device)) continue;
+        if (!found) { *memtype = drives[i].bufmem; *maxtx = 0xFFFFFFFFUL; found = 1; }
+        *mask &= drives[i].mask;
+        if (drives[i].maxtx && drives[i].maxtx < *maxtx) *maxtx = drives[i].maxtx;
+    }
+    if (found && *maxtx == 0xFFFFFFFFUL) *maxtx = 0x10000;
+    *maxtx &= ~511UL;
+    if (*maxtx < 512) *maxtx = 512;
+}
+
+static int do_rawread(int sock, const UBYTE *p, ULONG len)
+{
+    ULONG unit, flags, offhi, offlo, length, memtype, mask, maxtx, done = 0;
+    char device[64];
+    ULONG namelen;
+    UBYTE *buf;
+    struct rawdev d;
+    UWORD cmd64 = NSCMD_TD_READ64;
+    char msg[160];
+
+    if (len < 21) return send_err(sock, "RAWREAD needs unit, flags, offset, length and a device name");
+    unit = get_be32(p); flags = get_be32(p + 4);
+    offhi = get_be32(p + 8); offlo = get_be32(p + 12); length = get_be32(p + 16);
+    namelen = len - 20;
+    if (namelen > sizeof device - 1) return send_err(sock, "device name too long");
+    CopyMem((APTR)(p + 20), device, namelen);
+    device[namelen] = '\0';
+    if (length == 0 || length > RAWREAD_MAX || (length & 511) || (offlo & 511))
+        return send_err(sock, "offset and length must be multiples of 512, length at most 1 MiB");
+
+    unit_rules(device, unit, &memtype, &mask, &maxtx);
+    buf = (UBYTE *)AllocVec(length, memtype);
+    if (!buf) return send_err(sock, "out of memory for this range; ask for a smaller one");
+    /* The mask's low bits are an alignment rule for the start; the high
+     * bits are the address range the controller's DMA reaches. */
+    if (((ULONG)buf & ~mask) || (((ULONG)buf + length - 1) & ~(mask | 3UL))) {
+        FreeVec(buf);
+        return send_err(sock, "no memory this controller can reach (its Mask); ask for a smaller range");
+    }
+    if (!rawdev_open(&d, device, unit, flags)) {
+        rawdev_close(&d); FreeVec(buf);
+        sprintf(msg, "cannot open %s unit %lu", device, (unsigned long)unit);
+        return send_err(sock, msg);
+    }
+    say("rawread: %s %lu, %lu bytes at %lu:%lu\n", device, (unsigned long)unit,
+        (unsigned long)length, (unsigned long)offhi, (unsigned long)offlo);
+    while (done < length) {
+        ULONG chunk = length - done, lo = offlo + done, hi = offhi + (lo < offlo ? 1 : 0);
+        BYTE err;
+        if (chunk > maxtx) chunk = maxtx;
+        d.io->io_Data = buf + done;
+        d.io->io_Length = chunk;
+        d.io->io_Offset = lo;
+        if (hi == 0 && lo + chunk - 1 >= lo) {
+            d.io->io_Command = CMD_READ;
+            d.io->io_Actual = 0;
+            err = DoIO((struct IORequest *)d.io);
+        } else {
+            /* Past 4 GB: the high half travels in io_Actual. */
+            d.io->io_Command = cmd64;
+            d.io->io_Actual = hi;
+            err = DoIO((struct IORequest *)d.io);
+            if (err == IOERR_NOCMD && cmd64 == NSCMD_TD_READ64) {
+                cmd64 = TD_READ64;
+                d.io->io_Command = cmd64;
+                d.io->io_Data = buf + done; d.io->io_Length = chunk;
+                d.io->io_Offset = lo; d.io->io_Actual = hi;
+                err = DoIO((struct IORequest *)d.io);
+            }
+        }
+        if (err != 0 || d.io->io_Actual != chunk) {
+            rawdev_close(&d); FreeVec(buf);
+            sprintf(msg, "read error %ld at %lu:%lu", (long)err, (unsigned long)hi, (unsigned long)lo);
+            return send_err(sock, msg);
+        }
+        done += chunk;
+    }
+    rawdev_close(&d);
+    {
+        int ok = send_resp(sock, ST_OK, buf, length);
+        FreeVec(buf);
+        return ok;
+    }
 }
 
 /* REXXPORTS: the Amiga's public message ports, one name per line. These are the
@@ -2782,6 +3055,8 @@ static const char *cmd_name(UBYTE code)
     case CMD_AREXX:   return "AREXX";
     case CMD_REXXPORTS: return "REXXPORTS";
     case CMD_GETRANGE:  return "GETRANGE";
+    case CMD_DEVICES:   return "DEVICES";
+    case CMD_RAWREAD:   return "RAWREAD";
     default:          return "?";
     }
 }
@@ -2956,6 +3231,8 @@ static void serve(int sock, const char *client)
         case CMD_AREXX: do_arexx(sock, body, len); break;
         case CMD_REXXPORTS: do_rexxports(sock); break;
         case CMD_GETRANGE: do_getrange(sock, body, len); break;
+        case CMD_DEVICES: do_devices(sock); break;
+        case CMD_RAWREAD: do_rawread(sock, body, len); break;
         case CMD_INPUT: do_input(sock, body, len); break;
         case CMD_BREAK: do_break(sock); break;
         default:       send_err(sock, "unknown command"); break;

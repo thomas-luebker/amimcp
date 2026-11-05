@@ -62,6 +62,8 @@ exception: it precedes the real request on the same connection.
 | 0x12 | `AREXX`| ARexx program source, text          | `rc` (u32) + RESULT string |
 | 0x13 | `REXXPORTS` | *(empty)*                       | Public port names, one per line |
 | 0x14 | `GETRANGE` | `offset` (u32) + `length` (u32) + path | up to `length` file bytes |
+| 0x15 | `DEVICES` | *(empty)*                          | The disks behind the mounted drives, text — see below |
+| 0x16 | `RAWREAD` | `unit`, `flags`, `offset hi`, `offset lo`, `length` (u32 each) + device name | exactly `length` raw bytes |
 
 Text payloads are **not** NUL-terminated; the frame length delimits them.
 
@@ -83,6 +85,41 @@ clamped: the reply carries only the bytes that exist, so **a reply shorter than
 reply). Agents before 0.13.2 announced the full `length` and then sent less,
 leaving the client waiting mid-frame; size the file from `LIST` first if you
 must talk to one of those.
+
+## `DEVICES` and `RAWREAD` (0.14)
+
+Imaging a disk of a running Amiga over the network — Amiga Imager's "Add
+System from Card" and "Save Card as Image" with an Amiga as the source.
+Both are **read-only**: nothing in the agent writes to a device.
+
+`DEVICES` answers tab-separated lines. One `P` line per mounted drive that has
+a FileSysStartupMsg:
+
+    P name device unit flags blockbytes surfaces blockspertrack lowcyl highcyl
+      dostype(hex) bootpri bufmemtype(hex) mask(hex) maxtransfer(hex)
+
+and one `U` line per distinct device + unit, with what `TD_GETGEOMETRY` says
+(`0 0` when the device cannot answer, or cannot be opened at all — the
+EMU68BOOT entries of an image that runs in UAE, for example):
+
+    U device unit flags sectorsize totalsectors
+
+`RAWREAD` reads `length` bytes at the 64-bit `offset` from `device` `unit`
+(opened with `flags`). Offset and length are multiples of 512; length is at
+most 1 MiB. Offsets below 4 GiB use `CMD_READ`, others `NSCMD_TD_READ64`,
+falling back to `TD_READ64`. The whole range is read before the header goes
+out, so a failed read is `ST_ERR` (`read error <io_Error> at <hi>:<lo>`),
+never a short frame. The buffer follows the unit's mounted partitions the way
+their filesystem's buffers do — `BufMemType`, the DMA `Mask` (its low bits
+an alignment rule for the start) and the smallest `MaxTransfer` per I/O — so
+a controller with 24-bit DMA gets memory it can reach. A client that gets
+"out of memory" or a Mask error asks again for a smaller range.
+
+Validated 2026-11-05 in FS-UAE (`uaehf.device`): every range byte-identical
+to the hardfile on the host, including reads at and across 4 GiB (sparse
+8 GiB second unit) and a 2 GiB partition end to end; bad offsets and lengths,
+unknown devices and an empty floppy drive (`read error 29`) are refused.
+Not yet run on real hardware (A4000 `scsi.device`, PiStorm `brcm-sdhc`).
 
 ## Statuses (response `code`)
 

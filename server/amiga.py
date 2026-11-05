@@ -31,6 +31,8 @@ CMD_UITREE = 0x0D
 CMD_AREXX = 0x12
 CMD_REXXPORTS = 0x13
 CMD_GETRANGE = 0x14
+CMD_DEVICES = 0x15
+CMD_RAWREAD = 0x16
 CMD_UIACT = 0x0E
 CMD_MENUS = 0x0F
 CMD_AUTH = 0x10
@@ -268,6 +270,39 @@ class Amiga:
             CMD_GETRANGE, struct.pack(">II", offset, length) + path.encode("latin-1"),
             timeout=max(self.timeout, 120.0),
         )
+
+    def devices(self) -> tuple[list[dict], list[dict]]:
+        """The disks behind the mounted drives (agent 0.14+).
+
+        Returns (partitions, units). A partition is one mounted drive with
+        its exec device, unit and DosEnvec numbers; a unit is one distinct
+        device+unit with the geometry it reports (0 when it cannot say).
+        """
+        text = self._request(CMD_DEVICES).decode("latin-1", "replace")
+        parts, units = [], []
+        for line in text.split("\n"):
+            f = line.split("\t")
+            if f[0] == "P" and len(f) == 15:
+                parts.append(dict(name=f[1], device=f[2], unit=int(f[3]), flags=int(f[4]),
+                                  block_bytes=int(f[5]), surfaces=int(f[6]),
+                                  blocks_per_track=int(f[7]), low_cyl=int(f[8]),
+                                  high_cyl=int(f[9]), dos_type=int(f[10], 16),
+                                  boot_pri=int(f[11]), buf_mem_type=int(f[12], 16),
+                                  mask=int(f[13], 16), max_transfer=int(f[14], 16)))
+            elif f[0] == "U" and len(f) == 6:
+                units.append(dict(device=f[1], unit=int(f[2]), flags=int(f[3]),
+                                  sector_size=int(f[4]), total_sectors=int(f[5])))
+        return parts, units
+
+    def raw_read(self, device: str, unit: int, offset: int, length: int, flags: int = 0) -> bytes:
+        """Read `length` raw bytes at `offset` from an exec device (agent 0.14+).
+
+        Read-only. Offset and length are multiples of 512, length at most
+        1 MiB; offsets past 4 GiB use NSCMD_TD_READ64 / TD_READ64.
+        """
+        payload = struct.pack(">IIIII", unit, flags, offset >> 32, offset & 0xFFFFFFFF, length)
+        return self._request(CMD_RAWREAD, payload + device.encode("latin-1"),
+                             timeout=max(self.timeout, 120.0))
 
     def write_file(self, path: str, data: bytes) -> None:
         p = path.encode("latin-1")

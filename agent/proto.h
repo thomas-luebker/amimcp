@@ -74,6 +74,29 @@
                          * `length` bytes. Lets a client stream a file larger
                          * than the 16 MiB frame limit in pieces. */
 
+#define CMD_DEVICES 0x15  /* the disks behind the mounted drives. Empty request;
+                         * reply is tab-separated text, one record per line:
+                         *   P  dosname device unit flags blockbytes surfaces
+                         *      blockspertrack lowcyl highcyl dostype bootpri
+                         *      bufmemtype mask maxtransfer   (hex where a C
+                         *      programmer would expect it, see do_devices)
+                         *   U  device unit flags sectorsize totalsectors
+                         * one P per mounted drive, one U per distinct
+                         * device+unit (TD_GETGEOMETRY; 0 0 when the device
+                         * cannot say). Read-only. */
+#define CMD_RAWREAD 0x16  /* read raw blocks from an exec device, never write.
+                         * Payload: u32 unit, u32 open flags, u32 offset high,
+                         * u32 offset low, u32 length, then the device name
+                         * (text). Offset and length are multiples of 512,
+                         * length at most RAWREAD_MAX. Reply: exactly `length`
+                         * bytes, or ST_ERR - the whole range is read before
+                         * the header goes out, so a failed read is an error
+                         * and never a short frame. 64-bit offsets go through
+                         * NSCMD_TD_READ64, else TD_READ64. Buffers follow the
+                         * BufMemType/Mask/MaxTransfer of the unit's mounted
+                         * partitions, as its filesystem's do. */
+#define RAWREAD_MAX (1024UL * 1024UL)
+
 /* CMD_SHOT payload is optional, and omitting it means "the whole frontmost
  * screen" exactly as before:
  *
@@ -154,6 +177,6 @@
 #define SHOT_CHUNKY 1   /* palette + 1 byte/pixel */
 #define SHOT_RGB24  2   /* 3 bytes/pixel, no palette */
 
-#define AMIAGENT_VERSION "0.13.2"
+#define AMIAGENT_VERSION "0.14.0"
 
 #endif /* AMIMCP_PROTO_H */
