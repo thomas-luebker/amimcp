@@ -32,29 +32,41 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "server"))
 
 from amiga import Amiga  # noqa: E402
 
-BINARY = os.path.join(HERE, "..", "..", "dist", "stage", "amibench", "amibench")
+# The binary `make` builds here. It used to point at dist/stage, which held a
+# stale version-2 build without the FPU and Chip phases.
+BINARY = os.path.join(HERE, "amibench")
 TICKS_PER_SEC = 50.0
 
 
 def parse(out: str):
-    """amibench's output → (bufsz, {phase: (reps, ticks)})."""
-    bufsz, phases = None, {}
+    """amibench's output → (bufsz, chipsz, {phase: (reps, ticks)})."""
+    bufsz, chipsz, phases = None, None, {}
     for line in out.strip().split("\n"):
         tok = line.split()
         if not tok:
             continue
         if tok[0] == "amibench" and "bufsz" in tok:
             bufsz = int(tok[tok.index("bufsz") + 1])
+            if "chipsz" in tok:
+                chipsz = int(tok[tok.index("chipsz") + 1])
         elif len(tok) >= 5 and tok[1] == "reps":
             phases[tok[0]] = (int(tok[2]), int(tok[4]))
-    return bufsz, phases
+    return bufsz, chipsz, phases
 
 
-def rates(bufsz: int, phases: dict) -> dict:
+def rates(bufsz: int, chipsz: int | None, phases: dict) -> dict:
+    """Iterations/s for int and fpu, bytes/s for the memory phases. The Chip
+    phases move CHIPSZ per rep, not BUFSZ - dividing by the Fast buffer size
+    reported Chip RAM 8x too fast."""
     out = {}
     for name, (reps, ticks) in phases.items():
         secs = ticks / TICKS_PER_SEC
-        out[name] = reps / secs if name == "int" else reps * bufsz / secs
+        if name in ("int", "fpu"):
+            out[name] = reps / secs
+        elif name.startswith("chip"):
+            out[name] = reps * chipsz / secs
+        else:
+            out[name] = reps * bufsz / secs
     return out
 
 
@@ -73,10 +85,10 @@ def measure(host: str, token: str, runs: int) -> list[dict]:
     results = []
     for _ in range(runs):
         rc, out = a.exec_command("RAM:amibench", timeout=200)
-        bufsz, phases = parse(out)
+        bufsz, chipsz, phases = parse(out)
         if not phases:
             raise SystemExit("%s: unparsable amibench output:\n%s" % (host, out))
-        results.append(rates(bufsz, phases))
+        results.append(rates(bufsz, chipsz, phases))
         time.sleep(2)
     return results
 
@@ -95,17 +107,21 @@ def main() -> int:
             print("cycle %d/%d  %s" % (cycle + 1, args.cycles, host))
             collected[host] += measure(host, args.token, args.runs)[1:]
 
-    print("\n%-22s %12s %10s %10s %10s %9s" %
-          ("host", "int M ops/s", "copy MB/s", "set MB/s", "read MB/s", "copy:int"))
+    print("\n%-22s %12s %8s %10s %10s %10s %9s %9s %9s" %
+          ("host", "int M ops/s", "fpu M/s", "copy MB/s", "set MB/s", "read MB/s",
+           "chip cp", "chip rd", "copy:int"))
     for host in args.hosts:
         runs = collected[host]
         if not runs:
             continue
         med = {k: statistics.median(r[k] for r in runs) for k in runs[0]}
         spread = (max(r["int"] for r in runs) - min(r["int"] for r in runs)) / med["int"] * 100
-        print("%-22s %12.2f %10.0f %10.0f %10.0f %9.1f   (int spread %.1f%%, n=%d)" %
-              (host, med["int"] / 1e6, med["copy"] / 1048576, med["set"] / 1048576,
-               med["read"] / 1048576, (med["copy"] / 1048576) / (med["int"] / 1e6),
+        fpu = "%8.2f" % (med["fpu"] / 1e6) if "fpu" in med else "%8s" % "-"
+        chip = ("%9.2f %9.2f" % (med["chipcopy"] / 1048576, med["chipread"] / 1048576)
+                if "chipcopy" in med else "%9s %9s" % ("-", "-"))
+        print("%-22s %12.2f %s %10.1f %10.1f %10.1f %s %9.1f   (int spread %.1f%%, n=%d)" %
+              (host, med["int"] / 1e6, fpu, med["copy"] / 1048576, med["set"] / 1048576,
+               med["read"] / 1048576, chip, (med["copy"] / 1048576) / (med["int"] / 1e6),
                spread, len(runs)))
     # copy:int is the shape of the machine, not its speed: ~6 on real hardware,
     # ~11 under a JIT, 40-66 interpreted. Data movement stays near host speed

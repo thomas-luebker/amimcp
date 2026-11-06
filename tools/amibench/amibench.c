@@ -23,6 +23,7 @@
 #include <dos/dos.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 extern struct ExecBase *SysBase;
 
@@ -61,7 +62,6 @@ static ULONG elapsed(ULONG start, ULONG end)
 
 /* Sinks: volatile so -O2 cannot delete the loops it is meant to time. */
 static volatile ULONG g_sink;
-static volatile double g_fsink;
 static UBYTE *g_src, *g_dst;         /* Fast */
 static UBYTE *g_csrc, *g_cdst;       /* Chip */
 
@@ -77,21 +77,10 @@ static void run_int(ULONG reps)
     g_sink = a + b + c;
 }
 
-/* Dependency-chained doubles, so the FPU cannot overlap iterations. The
- * constants converge rather than diverge: values stay finite and normal, and
- * a denormal or a NaN would change the timing of what we are measuring. */
-static void run_fpu(ULONG reps)
-{
-    ULONG i;
-    double a = 1.5, b = 3.25, c = 7.125;
-    for (i = 0; i < reps; i++) {
-        a = a * 0.5 + 0.25;
-        b = b * 0.25 + a;
-        c = c * 0.125 + b;
-        a = a + c * 0.5;
-    }
-    g_fsink = a + b + c;
-}
+/* The FPU phase lives in fpu.c, the only file compiled with -m68881 - see
+ * the comment there for why the rest of the program must not be. */
+extern void run_fpu(ULONG reps);
+
 
 static void run_copy(ULONG reps)
 {
@@ -154,6 +143,18 @@ static void run_chipread(ULONG reps)
     g_sink = sum;
 }
 
+/* AllocMem'd memory is NOT returned when a program exits - it stays gone
+ * until the next reboot. So every way out, the Ctrl-C one included, frees
+ * the buffers here first. (The first Ctrl-C version called exit() straight
+ * away and leaked 9 MB on the A1200 it was tested on.) */
+static void free_all(void)
+{
+    if (g_csrc) { FreeMem(g_csrc, CHIPSZ); g_csrc = NULL; }
+    if (g_cdst) { FreeMem(g_cdst, CHIPSZ); g_cdst = NULL; }
+    if (g_src)  { FreeMem(g_src,  BUFSZ);  g_src  = NULL; }
+    if (g_dst)  { FreeMem(g_dst,  BUFSZ);  g_dst  = NULL; }
+}
+
 /* Quadruple reps until the phase runs long enough to time honestly, then
  * print the pair the host needs. */
 static void phase(const char *name, void (*fn)(ULONG), ULONG start_reps)
@@ -164,6 +165,16 @@ static void phase(const char *name, void (*fn)(ULONG), ULONG start_reps)
         t0 = now_ticks();
         fn(reps);
         t = elapsed(t0, now_ticks());
+        /* Ctrl-C after every attempt, never inside the timed loop. Without
+         * it a run that misbehaves can only be ended by resetting the
+         * machine: amiagent's BREAK sends Ctrl-C, and nothing here used to
+         * look. Checked before the "long enough" test, so a phase that
+         * settles on its first attempt still notices. */
+        if (SetSignal(0, SIGBREAKF_CTRL_C) & SIGBREAKF_CTRL_C) {
+            printf("*** break in %s\n", name);
+            free_all();
+            exit(5);
+        }
         if (t >= MIN_TICKS)
             break;
         /* Break BEFORE scaling: an early version quadrupled and then let the
@@ -189,8 +200,7 @@ int main(void)
     if (!g_src || !g_dst) {
         printf("amibench: out of Fast memory (need %lu KB)\n",
                (unsigned long)(2 * BUFSZ / 1024));
-        if (g_src) FreeMem(g_src, BUFSZ);
-        if (g_dst) FreeMem(g_dst, BUFSZ);
+        free_all();
         return 20;
     }
 
@@ -220,9 +230,6 @@ int main(void)
                (unsigned long)(2 * CHIPSZ / 1024));
     }
 
-    if (g_csrc) FreeMem(g_csrc, CHIPSZ);
-    if (g_cdst) FreeMem(g_cdst, CHIPSZ);
-    FreeMem(g_src, BUFSZ);
-    FreeMem(g_dst, BUFSZ);
+    free_all();
     return 0;
 }

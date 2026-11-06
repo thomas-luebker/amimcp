@@ -10,8 +10,9 @@ agent/amimon.020
 agent/amimon-mui
 agent/amimon-mui.020
 
-# amibench build artifact — produced by the compile line in tools/amibench/README.md
+# amibench build artifacts — produced by `make` in tools/amibench
 tools/amibench/amibench
+tools/amibench/*.o
 
 # Release archives
 dist/

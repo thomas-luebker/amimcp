@@ -3,21 +3,29 @@
 A small CPU/memory benchmark for comparing Amigas, written to answer "how much
 faster is machine A than machine B" with numbers that survive scrutiny.
 
-Built for **68020** so one identical binary runs on an 040, an 060 and Emu68's
-JIT alike — comparing two different builds would measure the compiler as much
-as the machine.
+Built for **68020** so one identical binary runs on an 020/030 (FPU or not),
+an 040, an 060 and Emu68's JIT alike — comparing two different builds would
+measure the compiler as much as the machine.
 
 ```
-m68k-amigaos-gcc -O2 -m68020 -noixemul -Wall -o amibench amibench.c
+make            # CC defaults to ~/opt/amiga/bin/m68k-amigaos-gcc
 ```
 
 Phases: integer ALU (dependency-chained, so it cannot be pipelined away),
 **FPU**, `memcpy`, `memset`, a linear read, and **Chip RAM** copy and read.
+Ctrl-C (amiagent's BREAK) stops it between calibration steps.
 
-> Built with `-m68881`, so it needs an FPU. Without that flag the compiler
+> **Only `fpu.c` is compiled with `-m68881`.** Without that flag the compiler
 > emits soft-float and the FPU phase would time an emulation library instead of
-> the coprocessor. The phase is still gated on `AttnFlags` at runtime, because
-> executing an FPU instruction on a machine without one traps.
+> the coprocessor. But the flag must not reach the link: it selects the FPU C
+> library, whose startup executes FPU instructions **before `main`**, so on a
+> 020/030 without a coprocessor the program died before its own `AttnFlags`
+> check ran — on an A1200/ACA1234 it printed nothing and blocked amiagent
+> until a reset (2026-11-06). Now the FPU phase is gated on `AttnFlags` and
+> skipped (`fpu skipped (no FPU)`) on such machines. The split changes no
+> measured code: `run_int`, the read loops and the Chip loops compile
+> identically, and the integer and FPU libraries' `memcpy`/`memset` are the
+> same instructions.
 
 ## Three things it does deliberately
 
