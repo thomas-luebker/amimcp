@@ -89,6 +89,30 @@ directory itself lists empty, because it is a write-only drop box.
 > cleanup: ask Aminet to remove the superseded archive, and prefer the form
 > next time.
 
+> **…except the form is currently unavailable** (checked 2026-09-11):
+> `aminet.net/upload` answers *"Web upload form is currently under
+> maintainance. Please use FTP for now."* So FTP is not the fallback at the
+> moment, it is the only route — which means **every upload made now owes a
+> cleanup mail**, and "use the form" is advice you cannot take. Check the page
+> before assuming either way; this is the kind of thing that changes back
+> without an announcement.
+
+**Asking for the old archive to be removed.** Mail `aminet@aminet.net`, naming
+the full paths of both the `.lha` and the `.readme`, the archive that
+supersedes them, and the `Uploader:` address on the originals. Keep it short —
+these are volunteers doing it by hand:
+
+```
+Please remove the superseded archive
+
+    comm/net/amiagent-<old>.lha
+    comm/net/amiagent-<old>.readme
+
+The current version, comm/net/amiagent-<new>.lha, was uploaded on <date>. Its
+.readme carries Replaces: comm/net/amiagent-<old>.lha, but both are still listed.
+Uploader and author on both is <the Uploader: address>.
+```
+
 > **Set the replace.** The `.readme` must carry a `Replaces:` line naming the
 > *previous* upload's full Aminet path, and the upload form's replace field
 > must name it too:
