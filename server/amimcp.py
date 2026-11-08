@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 import sys
 import traceback
 
@@ -266,6 +267,58 @@ TOOLS = [
             "machine itself."
         ),
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "amiga_abandon",
+        "description": (
+            "Leave a stuck amiga_shell command running and free the agent for "
+            "the next one. Use it when amiga_break did not stop the command, "
+            "typically one blocked inside a filesystem or device. The command "
+            "itself is not stopped; a reboot clears it."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "amiga_reboot",
+        "description": (
+            "Restart the Amiga from software. Needs a responsive amiagent; for a "
+            "frozen machine use pi_reset_amiga. Unsaved work is lost and every "
+            "session on the machine drops, so only call it when the user has "
+            "agreed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "confirm": {"type": "boolean", "description": "Must be true."},
+            },
+            "required": ["confirm"],
+        },
+    },
+    {
+        "name": "pi_status",
+        "description": (
+            "Report on the Raspberry Pi attached to the accelerator: uptime, its "
+            "a314d and firmware-page services, and whether the FPGA is configured "
+            "(CDONE). Works when the Amiga is down. Needs AMIGA_PI set."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "pi_reset_amiga",
+        "description": (
+            "Hard-reset the Amiga from the Raspberry Pi by reloading the "
+            "accelerator's FPGA from flash, for when the Amiga is frozen and "
+            "amiga_reboot cannot reach it. Writes nothing to flash. Unsaved work "
+            "is lost, so only call it when the user has agreed. If the Amiga does "
+            "not start booting, it needs its reset button. Needs AMIGA_PI set."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "confirm": {"type": "boolean", "description": "Must be true."},
+            },
+            "required": ["confirm"],
+        },
     },
     {
         "name": "amiga_click",
@@ -767,6 +820,56 @@ def tool_break(ami: Amiga, args: dict) -> list[dict]:
     return [{"type": "text", "text": ami.break_command().strip() or "Break sent."}]
 
 
+def tool_abandon(ami: Amiga, args: dict) -> list[dict]:
+    return [{"type": "text", "text": ami.abandon_command().strip()}]
+
+
+def require_confirm(args: dict, what: str) -> None:
+    if args.get("confirm") is not True:
+        raise AmigaError(f"{what} needs confirm=true. Check with the user first.")
+
+
+def tool_reboot(ami: Amiga, args: dict) -> list[dict]:
+    require_confirm(args, "amiga_reboot")
+    return [{"type": "text", "text": ami.reboot().strip()}]
+
+
+def pi_run(command: str, timeout: float) -> str:
+    """One fixed command on the Pi over SSH, key login only."""
+    target = os.environ.get("AMIGA_PI", "")
+    if not target:
+        raise AmigaError("AMIGA_PI is not set (for example user@hostname.local).")
+    try:
+        done = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+             "-o", "StrictHostKeyChecking=accept-new", target, command],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise AmigaError(f"no answer from the Pi within {timeout:g}s") from e
+    if done.returncode != 0:
+        raise AmigaError((done.stderr or done.stdout).strip()
+                         or f"the Pi command failed ({done.returncode})")
+    return done.stdout.strip()
+
+
+def tool_pi_status(ami: Amiga, args: dict) -> list[dict]:
+    text = pi_run(
+        "hostname; uptime -p; "
+        'for s in a314d tfpi-web; do echo "$s: $(systemctl is-active $s)"; done; '
+        'pinctrl get 23 | grep -Eq "\\|\\s*hi(\\s|$)" '
+        '&& echo "FPGA CDONE: high" || echo "FPGA CDONE: low"',
+        timeout=30,
+    )
+    return [{"type": "text", "text": text}]
+
+
+def tool_pi_reset_amiga(ami: Amiga, args: dict) -> list[dict]:
+    require_confirm(args, "pi_reset_amiga")
+    text = pi_run("sudo -n a4000-reset --yes", timeout=60)
+    return [{"type": "text", "text": text}]
+
+
 def tool_click(ami: Amiga, args: dict) -> list[dict]:
     x, y = int(args["x"]), int(args["y"])
     button = args.get("button", "left")
@@ -883,6 +986,10 @@ HANDLERS = {
     "amiga_arexx": tool_arexx,
     "amiga_rexx_ports": tool_rexx_ports,
     "amiga_break": tool_break,
+    "amiga_abandon": tool_abandon,
+    "amiga_reboot": tool_reboot,
+    "pi_status": tool_pi_status,
+    "pi_reset_amiga": tool_pi_reset_amiga,
     "amiga_click": tool_click,
     "amiga_drag": tool_drag,
     "amiga_button": tool_button,
@@ -1019,14 +1126,54 @@ class Server:
 # Entry point
 # ---------------------------------------------------------------------------
 
+# amifleet's own preference file: the one place a machine's address and token
+# are written down. AMIGA_NODE names a machine in it, so a client that starts
+# this server needs no token in its own configuration.
+FLEET_PREFS = os.path.expanduser(
+    "~/Library/Preferences/com.amiga-imager.amifleet.plist")
+
+
+def fleet_node(name: str) -> dict | None:
+    """Host, port and token of a machine amifleet knows, by name."""
+    import plistlib
+    try:
+        with open(FLEET_PREFS, "rb") as fh:
+            raw = plistlib.load(fh).get("amifleet.machines")
+    except (OSError, plistlib.InvalidFileException):
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        nodes = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        return None
+    for node in nodes:
+        if str(node.get("name", "")).lower() == name.lower():
+            return node
+    return None
+
+
 def build_client() -> Amiga:
     host = os.environ.get("AMIGA_HOST", "")
+    port = os.environ.get("AMIGA_PORT", "7846")
+    token = os.environ.get("AMIGA_TOKEN", "")
+    name = os.environ.get("AMIGA_NODE", "")
+    # AMIGA_HOST wins: it is how a machine amifleet has never heard of is reached.
+    if not host and name:
+        node = fleet_node(name)
+        if node is None:
+            log(f"AMIGA_NODE={name} is not a machine amifleet knows.")
+        else:
+            host = str(node.get("host", ""))
+            port = str(node.get("port", port))
+            token = str(node.get("token", ""))
     if not host:
-        log("AMIGA_HOST is not set — every tool call will fail until it is.")
+        log("Neither AMIGA_HOST nor a known AMIGA_NODE is set — every tool call "
+            "will fail until one is.")
     return Amiga(
         host=host or "0.0.0.0",
-        port=int(os.environ.get("AMIGA_PORT", "7846")),
-        token=os.environ.get("AMIGA_TOKEN", ""),
+        port=int(port),
+        token=token,
         timeout=float(os.environ.get("AMIGA_TIMEOUT", "30")),
     )
 

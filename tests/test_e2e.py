@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -228,6 +229,21 @@ class TestHungCommand(Base):
         rc, out = self.ami.exec_command("Version", timeout=5)
         self.assertEqual(rc, 0)
         self.assertIn("Kickstart", out)
+
+    def test_plain_is_used_when_the_agent_offers_no_tls(self):
+        self.ami.ping()
+        self.assertEqual(self.ami.transport, "plain")
+
+    def test_tls_pin_is_learned_then_enforced(self):
+        from amiga import check_tls_pin
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pins.json")
+            check_tls_pin("host:7847", "aa" * 32, path)
+            check_tls_pin("host:7847", "aa" * 32, path)
+            check_tls_pin("other:7847", "bb" * 32, path)
+            with self.assertRaises(AmigaError) as ctx:
+                check_tls_pin("host:7847", "cc" * 32, path)
+            self.assertIn("changed", str(ctx.exception))
 
     def test_abandon_with_nothing_running_is_a_clear_error(self):
         with self.assertRaises(AmigaError) as ctx:
@@ -493,6 +509,68 @@ class TestMCP(Base):
         self.assertFalse(res["isError"])
         self.assertIn("Ctrl-C", res["content"][0]["text"])
         fake_agent.JOB.active = None
+
+    def test_abandon_tool(self):
+        with self.assertRaises(AmigaError):
+            self.ami.exec_command("sleep 30", timeout=1)
+        res = self.tool("amiga_abandon")
+        self.assertFalse(res["isError"])
+        self.assertIn("abandoned", res["content"][0]["text"])
+
+    def test_reboot_tool_needs_confirm(self):
+        res = self.tool("amiga_reboot")
+        self.assertTrue(res["isError"])
+        self.assertIn("confirm", res["content"][0]["text"])
+        res = self.tool("amiga_reboot", {"confirm": True})
+        self.assertFalse(res["isError"])
+        self.assertIn("rebooting", res["content"][0]["text"])
+
+    def pi(self, stdout="ok\n", rc=0):
+        from unittest import mock
+        done = subprocess.CompletedProcess([], rc, stdout, "")
+        env = mock.patch.dict(os.environ, {"AMIGA_PI": "user@pi.example"})
+        run = mock.patch.object(amimcp.subprocess, "run", return_value=done)
+        env.start()
+        self.addCleanup(env.stop)
+        started = run.start()
+        self.addCleanup(run.stop)
+        return started
+
+    def test_pi_tools_explain_a_missing_target(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AMIGA_PI", None)
+            res = self.tool("pi_status")
+        self.assertTrue(res["isError"])
+        self.assertIn("AMIGA_PI", res["content"][0]["text"])
+
+    def test_pi_status_reaches_the_configured_pi(self):
+        run = self.pi("a4000pi\n")
+        res = self.tool("pi_status")
+        self.assertFalse(res["isError"])
+        self.assertIn("a4000pi", res["content"][0]["text"])
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[0], "ssh")
+        self.assertIn("BatchMode=yes", argv)
+        self.assertIn("user@pi.example", argv)
+
+    def test_pi_reset_without_confirm_never_touches_the_pi(self):
+        run = self.pi()
+        for args in ({}, {"confirm": False}, {"confirm": "true"}):
+            self.assertTrue(self.tool("pi_reset_amiga", args)["isError"])
+        run.assert_not_called()
+
+    def test_pi_reset_with_confirm_runs_the_reset(self):
+        run = self.pi("FPGA reloaded\n")
+        res = self.tool("pi_reset_amiga", {"confirm": True})
+        self.assertFalse(res["isError"])
+        self.assertEqual(run.call_args.args[0][-1], "sudo -n a4000-reset --yes")
+
+    def test_pi_failure_is_reported(self):
+        self.pi("a flash or diagnostics job is running\n", rc=3)
+        res = self.tool("pi_reset_amiga", {"confirm": True})
+        self.assertTrue(res["isError"])
+        self.assertIn("flash", res["content"][0]["text"])
 
     def test_shell_tool_surfaces_a_stuck_command_as_is_error(self):
         with self.assertRaises(AmigaError):

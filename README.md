@@ -333,14 +333,37 @@ forward the port.** Without a token, anything on your network segment can run
 one.
 
 **Optional TLS (agent 0.9.0+).** On a machine with [AmiSSL](http://aminet.net/package/util/libs/AmiSSL)
-installed, build the agent with `make SSL=1` and it opens a second, encrypted
-listener (the plain port + 1). The bundled clients — amifleet and Amiga Imager —
-try TLS first and fall back to plain automatically, pinning the agent's
-self-signed certificate trust-on-first-use (like SSH). Fast machines (68040/060,
-PiStorm, Vampire) handle it comfortably; slower ones stay on plain. With TLS the
-token and everything else travels encrypted; without it the token is compared
-byte-for-byte and travels in cleartext, so it stops a stray port scan, not
-someone with a packet sniffer on your LAN.
+installed, build the agent with
+`make SSL=1 AMISSL_SDK=/path/to/AmiSSL/Developer CPU=68020` and it opens a second,
+encrypted listener (the plain port + 1), generating its own certificate as
+`amiagent.pem` next to the binary on first run. The default build has no TLS. The
+bundled clients amifleet and Amiga Imager try TLS first and fall back to plain
+automatically, pinning the agent's self-signed certificate trust-on-first-use
+(like SSH).
+
+The Python client and the MCP server stay on plain unless you turn TLS on:
+
+```sh
+AMIGA_TLS=on python3 server/amimcp.py
+```
+
+For an MCP client, add `AMIGA_TLS=on` to the server's environment in its
+configuration. What turning it on means:
+
+- **Encryption.** The token and everything else travel encrypted. On plain, the
+  token is compared byte-for-byte and travels in cleartext, so it stops a stray
+  port scan, not someone with a packet sniffer on your LAN.
+- **Speed.** Every command is a new connection, so every command pays for a full
+  handshake: about 2 seconds on a 68060 at 50 MHz, against about 0.015 seconds on
+  plain. One-off commands barely notice; screenshot loops and many small file
+  transfers do. Slower CPUs will take longer, and are better left on plain.
+- **It can still fall back.** If the TLS port does not answer, the client uses
+  plain without saying so, and the token goes out in cleartext. TLS here protects
+  against someone listening, not against someone able to block the port.
+- **A changed certificate is refused.** The first connection pins the fingerprint
+  in `~/.amiga-fleet/tls-pins.json`. Reinstalling the agent or deleting
+  `amiagent.pem` creates a new certificate, and you then need to remove that
+  machine's entry from the file.
 
 ## Verified on
 

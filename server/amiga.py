@@ -7,9 +7,18 @@ Amiga.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import socket
+import ssl
 import struct
+import tempfile
+import time
 from dataclasses import dataclass
+
+# Trust-on-first-use fingerprints of each agent's self-signed certificate.
+TLS_PINS = os.path.expanduser("~/.amiga-fleet/tls-pins.json")
 
 MAGIC = b"AMI0"
 HDRLEN = 12
@@ -129,6 +138,31 @@ def _rawkey(key: str | int) -> int:
     )
 
 
+def check_tls_pin(key: str, fingerprint: str, path: str | None = None) -> None:
+    """Remember an agent's certificate the first time, refuse a different one."""
+    path = path or TLS_PINS
+    try:
+        with open(path) as fh:
+            pins = json.load(fh)
+    except (OSError, ValueError):
+        pins = {}
+    known = pins.get(key)
+    if known == fingerprint:
+        return
+    if known:
+        raise AmigaError(
+            f"the TLS certificate of {key} has changed (pinned {known[:16]}..., got "
+            f"{fingerprint[:16]}...). If the agent was reinstalled, remove its entry "
+            f"from {path}; otherwise something may be intercepting the connection."
+        )
+    pins[key] = fingerprint
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    with os.fdopen(fd, "w") as fh:
+        json.dump(pins, fh, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
 def _frame(code: int, payload: bytes) -> bytes:
     return MAGIC + bytes([code, 0, 0, 0]) + struct.pack(">I", len(payload)) + payload
 
@@ -147,8 +181,50 @@ class Amiga:
         self.port = port
         self.token = token
         self.timeout = timeout
+        # Opt-in: every command is a new connection, and a handshake costs a
+        # 68060 at 50 MHz about 2 s against 15 ms for plain.
+        self.tls = os.environ.get("AMIGA_TLS", "off").lower() == "on"
+        self.transport = "none"
+        self._tls_retry_at = 0.0
 
     # -- plumbing ---------------------------------------------------------
+
+    def _connect_tls(self) -> socket.socket | None:
+        """A pinned TLS connection on port+1, or None if the agent offers none."""
+        tlsport = self.port + 1
+        try:
+            raw = socket.create_connection((self.host, tlsport),
+                                           timeout=min(self.timeout, 3.0))
+        except OSError:
+            return None
+        try:
+            # The handshake is real work for a 68k: seconds, not milliseconds.
+            raw.settimeout(max(self.timeout, 30.0))
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE   # self-signed; pinned below instead
+            sock = ctx.wrap_socket(raw)
+            fingerprint = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
+        except OSError:                       # ssl.SSLError is an OSError
+            raw.close()
+            return None
+        try:
+            check_tls_pin(f"{self.host}:{tlsport}", fingerprint)
+        except AmigaError:
+            sock.close()
+            raise
+        return sock
+
+    def _connect(self) -> socket.socket:
+        if self.tls and time.monotonic() >= self._tls_retry_at:
+            sock = self._connect_tls()
+            if sock is not None:
+                self.transport = "tls"
+                return sock
+            self._tls_retry_at = time.monotonic() + 60.0
+        sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        self.transport = "plain"
+        return sock
 
     def _recv_exact(self, sock: socket.socket, n: int) -> bytes:
         chunks = []
@@ -188,7 +264,7 @@ class Amiga:
 
     def _request(self, code: int, payload: bytes = b"", timeout: float | None = None) -> bytes:
         try:
-            sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+            sock = self._connect()
         except OSError as e:
             raise AmigaUnreachable(
                 f"cannot reach amiagent at {self.host}:{self.port} ({e}). "
