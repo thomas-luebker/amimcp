@@ -221,6 +221,22 @@ class TestHungCommand(Base):
             self.ami.break_command()
         self.assertIn("no command is running", str(ctx.exception))
 
+    def test_abandon_frees_the_slot_while_the_command_runs_on(self):
+        with self.assertRaises(AmigaError):
+            self.ami.exec_command("sleep 30", timeout=1)
+        self.assertIn("abandoned", self.ami.abandon_command())
+        rc, out = self.ami.exec_command("Version", timeout=5)
+        self.assertEqual(rc, 0)
+        self.assertIn("Kickstart", out)
+
+    def test_abandon_with_nothing_running_is_a_clear_error(self):
+        with self.assertRaises(AmigaError) as ctx:
+            self.ami.abandon_command()
+        self.assertIn("no command is running", str(ctx.exception))
+
+    def test_reboot_replies(self):
+        self.assertEqual(self.ami.reboot(), "rebooting")
+
 
 class TestInput(Base):
     def setUp(self):

@@ -65,7 +65,8 @@ class TestProtocolSync(unittest.TestCase):
 
     def test_command_codes_match(self):
         for name in ("PING", "EXEC", "GET", "PUT", "LIST", "INFO", "SHOT", "INPUT",
-                     "BREAK", "SCREENS", "POINTER", "HASH", "AUTH"):
+                     "BREAK", "SCREENS", "POINTER", "HASH", "AUTH",
+                     "ABANDON", "REBOOT"):
             self.assertEqual(
                 self.c[f"CMD_{name}"],
                 getattr(amiga, f"CMD_{name}"),

@@ -96,6 +96,9 @@
                          * BufMemType/Mask/MaxTransfer of the unit's mounted
                          * partitions, as its filesystem's do. */
 #define RAWREAD_MAX (1024UL * 1024UL)
+#define CMD_ABANDON 0x17  /* give up on a running EXEC: it keeps running and the
+                         * slot is free again. Empty request; text reply. */
+#define CMD_REBOOT 0x18   /* ColdReboot after replying. Empty request. */
 
 /* CMD_SHOT payload is optional, and omitting it means "the whole frontmost
  * screen" exactly as before:

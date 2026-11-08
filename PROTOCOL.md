@@ -64,6 +64,8 @@ exception: it precedes the real request on the same connection.
 | 0x14 | `GETRANGE` | `offset` (u32) + `length` (u32) + path | up to `length` file bytes |
 | 0x15 | `DEVICES` | *(empty)*                          | The disks behind the mounted drives, text — see below |
 | 0x16 | `RAWREAD` | `unit`, `flags`, `offset hi`, `offset lo`, `length` (u32 each) + device name | exactly `length` raw bytes |
+| 0x17 | `ABANDON` | *(empty)*                          | Text. The running `EXEC` is left running and the slot is free; up to 8 at once |
+| 0x18 | `REBOOT` | *(empty)*                           | Text, sent before `ColdReboot()` about 2 s later |
 
 Text payloads are **not** NUL-terminated; the frame length delimits them.
 

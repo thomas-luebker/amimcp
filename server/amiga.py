@@ -33,6 +33,8 @@ CMD_REXXPORTS = 0x13
 CMD_GETRANGE = 0x14
 CMD_DEVICES = 0x15
 CMD_RAWREAD = 0x16
+CMD_ABANDON = 0x17
+CMD_REBOOT = 0x18
 CMD_UIACT = 0x0E
 CMD_MENUS = 0x0F
 CMD_AUTH = 0x10
@@ -238,6 +240,14 @@ class Amiga:
     def break_command(self) -> str:
         """Ask the agent to Ctrl-C whatever command is stuck."""
         return self._request(CMD_BREAK).decode("latin-1", "replace")
+
+    def abandon_command(self) -> str:
+        """Leave a stuck command running and free the agent for the next one."""
+        return self._request(CMD_ABANDON).decode("latin-1", "replace")
+
+    def reboot(self) -> str:
+        """Ask the Amiga to restart itself. Drops every session on the machine."""
+        return self._request(CMD_REBOOT).decode("latin-1", "replace")
 
     def arexx(self, source: str, timeout: float = 60.0) -> tuple[int, str]:
         """Run an ARexx program string on the Amiga; return (rc, RESULT).

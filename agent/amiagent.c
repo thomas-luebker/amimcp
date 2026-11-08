@@ -565,7 +565,16 @@ struct job {
     ULONG started;           /* Delay ticks elapsed, for the "still running" message */
 };
 
-static struct job g_job;
+/* The current job. A pointer so ABANDON can hand the slot to a fresh struct
+ * while the stuck child keeps writing to the old one. */
+static struct job g_first_job;
+static struct job *g_jobp = &g_first_job;
+#define g_job (*g_jobp)
+
+/* Commands given up on with ABANDON that have not finished yet. */
+#define MAX_ABANDONED 8
+static struct job *g_abandoned[MAX_ABANDONED];
+static ULONG g_job_seq = 0;      /* keeps temp names unique across jobs */
 
 /* Record which CLI processes exist right now. System() runs the command in a
  * new CLI, so anything that appears after this snapshot is very likely ours —
@@ -586,8 +595,14 @@ static void cli_snapshot(ULONG *bits)
  * the parent may also be writing is not worth the risk. */
 static void job_entry(void)
 {
-    struct job *j = &g_job;
+    struct job *j;
+    struct Task *parent;
+    ULONG donemask;
     BPTR in, out, err = 0;
+
+    /* Our own job, which may stop being g_job while we run. The parent stores
+     * it once CreateNewProc has returned, so wait for that. */
+    while (!(j = (struct job *)FindTask(NULL)->tc_UserData)) Delay(1);
 
     j->rc = -1;
     out = Open((STRPTR)j->outname, MODE_NEWFILE);
@@ -618,8 +633,11 @@ static void job_entry(void)
     if (out) Close(out);
     if (err) Close(err);
 
+    /* Copy first: once done is set an abandoned job's struct may be freed. */
+    parent = j->parent;
+    donemask = 1UL << j->sigbit;
     j->done = 1;
-    Signal(j->parent, 1UL << j->sigbit);
+    Signal(parent, donemask);
 }
 
 /* Finish with a completed job: temp files gone, slot free for the next one. */
@@ -630,6 +648,37 @@ static void job_reap(void)
     g_job.busy = 0;
     g_job.done = 0;
     g_job.proc = NULL;
+}
+
+/* Clear up abandoned commands that have finished since. */
+static void abandoned_reap(void)
+{
+    int i;
+    for (i = 0; i < MAX_ABANDONED; i++) {
+        struct job *j = g_abandoned[i];
+        if (!j || !j->done) continue;
+        DeleteFile((STRPTR)j->outname);
+        if (j->have_err) DeleteFile((STRPTR)j->errname);
+        if (j != &g_first_job) FreeVec(j);
+        g_abandoned[i] = NULL;
+    }
+}
+
+/* Before the program's code goes away: a child still running in it would crash
+ * the machine. A command that never ends holds the exit here, harmlessly, with
+ * the sockets already closed so a new agent can start. */
+static void jobs_wait_all(void)
+{
+    int i, live;
+    do {
+        live = (g_job.busy && !g_job.done);
+        for (i = 0; i < MAX_ABANDONED; i++)
+            if (g_abandoned[i] && !g_abandoned[i]->done) live = 1;
+        if (live) Delay(50);
+    } while (live);
+    Delay(25);                  /* let a finishing child return from our code */
+    abandoned_reap();
+    if (g_job.busy) job_reap();
 }
 
 /* Send rc + captured output for a finished job. */
@@ -684,11 +733,13 @@ static int do_exec(int sock, const UBYTE *payload, ULONG len)
 
     /* An earlier command that outlived its deadline may have finished since. */
     if (g_job.busy && g_job.done) job_reap();
+    abandoned_reap();
 
     if (g_job.busy) {
         sprintf(msg,
                 "a command is still running after %lus and this agent runs one "
-                "at a time: \"%s\". Send BREAK to try to stop it, or wait.",
+                "at a time: \"%s\". Send BREAK to try to stop it, ABANDON to "
+                "leave it running and carry on, or wait.",
                 (unsigned long)(g_job.started / 50), g_job.cmd);
         return send_err(sock, msg);
     }
@@ -700,8 +751,12 @@ static int do_exec(int sock, const UBYTE *payload, ULONG len)
     CopyMem((APTR)payload, g_job.cmd, len);
     g_job.cmd[len] = '\0';
     g_job.have_err = (((struct Library *)DOSBase)->lib_Version >= 47);
-    sprintf(g_job.outname, "T:amiagent-%08lx.out", (unsigned long)FindTask(NULL));
-    sprintf(g_job.errname, "T:amiagent-%08lx.err", (unsigned long)FindTask(NULL));
+    /* Numbered, because an abandoned command still has its files open. */
+    g_job_seq++;
+    sprintf(g_job.outname, "T:amiagent-%08lx-%lu.out",
+            (unsigned long)FindTask(NULL), (unsigned long)g_job_seq);
+    sprintf(g_job.errname, "T:amiagent-%08lx-%lu.err",
+            (unsigned long)FindTask(NULL), (unsigned long)g_job_seq);
     g_job.parent = FindTask(NULL);
     g_job.rc = -1;
     g_job.done = 0;
@@ -727,6 +782,7 @@ static int do_exec(int sock, const UBYTE *payload, ULONG len)
         g_job.busy = 0;
         return send_err(sock, "could not create a process for the command");
     }
+    g_job.proc->pr_Task.tc_UserData = g_jobp;   /* job_entry waits for this */
 
     /* Poll rather than Wait() so Ctrl-C on the agent still works and the
      * deadline is honoured. 1/10s costs nothing next to running a command. */
@@ -747,6 +803,46 @@ static int do_exec(int sock, const UBYTE *payload, ULONG len)
             "to try to stop it, or run EXEC again later to pick up the result.",
             (unsigned)timeout);
     return send_err(sock, msg);
+}
+
+/* Give up on a stuck command: it stays running, unkillable as it may be, and
+ * the slot is free for the next EXEC. BREAK cannot help with a command blocked
+ * inside a handler; without this only a reboot could. */
+static int do_abandon(int sock)
+{
+    struct job *fresh;
+    char msg[640];
+    int i;
+
+    abandoned_reap();
+    if (!g_job.busy) return send_err(sock, "no command is running");
+    if (g_job.done) {
+        job_reap();
+        return send_resp(sock, ST_OK, "it had already finished", 23);
+    }
+    for (i = 0; i < MAX_ABANDONED && g_abandoned[i]; i++) ;
+    if (i == MAX_ABANDONED)
+        return send_err(sock, "too many abandoned commands are still running; "
+                              "reboot the Amiga");
+    fresh = AllocVec(sizeof *fresh, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!fresh) return send_err(sock, "no memory");
+    fresh->sigbit = g_job.sigbit;
+
+    sprintf(msg, "abandoned \"%s\". It is still running; EXEC works again.",
+            g_job.cmd);
+    g_abandoned[i] = g_jobp;
+    g_jobp = fresh;
+    return send_resp(sock, ST_OK, msg, strlen(msg));
+}
+
+/* A clean software restart. A frozen machine cannot run this, so that case
+ * needs a reset from outside. */
+static int do_reboot(int sock)
+{
+    send_resp(sock, ST_OK, "rebooting", 9);
+    Delay(100);                 /* the reply goes out, and disk buffers settle */
+    ColdReboot();
+    return 1;
 }
 
 /* Best effort: signal the child, and any CLI that appeared after it started —
@@ -3057,6 +3153,8 @@ static const char *cmd_name(UBYTE code)
     case CMD_GETRANGE:  return "GETRANGE";
     case CMD_DEVICES:   return "DEVICES";
     case CMD_RAWREAD:   return "RAWREAD";
+    case CMD_ABANDON:   return "ABANDON";
+    case CMD_REBOOT:    return "REBOOT";
     default:          return "?";
     }
 }
@@ -3235,6 +3333,8 @@ static void serve(int sock, const char *client)
         case CMD_RAWREAD: do_rawread(sock, body, len); break;
         case CMD_INPUT: do_input(sock, body, len); break;
         case CMD_BREAK: do_break(sock); break;
+        case CMD_ABANDON: do_abandon(sock); break;
+        case CMD_REBOOT: do_reboot(sock); break;
         default:       send_err(sock, "unknown command"); break;
         }
 
@@ -3689,5 +3789,6 @@ out:
     if (IntuitionBase) CloseLibrary((struct Library *)IntuitionBase);
 #endif
     self->pr_WindowPtr = oldwinptr;
+    jobs_wait_all();
     return rc;
 }

@@ -27,8 +27,8 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "server"))
 
 from amiga import (  # noqa: E402
-    CMD_AUTH, CMD_BREAK, CMD_EXEC, CMD_GET, CMD_GETRANGE, CMD_INFO, CMD_INPUT, CMD_LIST,
-    CMD_HASH, CMD_PING, CMD_POINTER, CMD_PUT, CMD_SCREENS, CMD_SHOT, HDRLEN,
+    CMD_ABANDON, CMD_AUTH, CMD_BREAK, CMD_EXEC, CMD_GET, CMD_GETRANGE, CMD_INFO, CMD_INPUT,
+    CMD_LIST, CMD_REBOOT, CMD_HASH, CMD_PING, CMD_POINTER, CMD_PUT, CMD_SCREENS, CMD_SHOT, HDRLEN,
     IN_BUTTON, IN_CLICK, IN_HOME, IN_KEY, IN_MOVE, IN_RMOVE, IN_SCRIPT,
     INS_WAIT, IN_TEXT, MAGIC, SHOT_CHUNKY, SHOT_RGB24, ST_AUTH, ST_ERR, ST_OK,
 )
@@ -238,8 +238,11 @@ JOB = Job()
 
 
 def _run_job(cmd: str, seconds: float) -> None:
-    broke = JOB.stop.wait(seconds)
+    mine = JOB.stop
+    broke = mine.wait(seconds)
     with JOB.lock:
+        if JOB.stop is not mine:       # abandoned: the slot belongs to someone else
+            return
         JOB.finished = True
         JOB.rc = 20 if broke else 0
         JOB.out = "*** Break\n" if broke else f"slept {seconds:g}s\n"
@@ -285,6 +288,14 @@ def fake_break() -> bytes:
     if ev:
         ev.set()
     return b"sent Ctrl-C to 1 process(es)"
+
+
+def fake_abandon() -> bytes:
+    with JOB.lock:
+        if not JOB.active:
+            raise Busy("no command is running")
+        cmd, JOB.active, JOB.finished, JOB.stop = JOB.active, None, False, threading.Event()
+    return f'abandoned "{cmd}". It is still running; EXEC works again.'.encode("latin-1")
 
 
 class Busy(Exception):
@@ -360,6 +371,10 @@ class Handler(socketserver.BaseRequestHandler):
                 self.reply(ST_OK, fake_exec(body))
             elif code == CMD_BREAK:
                 self.reply(ST_OK, fake_break())
+            elif code == CMD_ABANDON:
+                self.reply(ST_OK, fake_abandon())
+            elif code == CMD_REBOOT:
+                self.reply(ST_OK, b"rebooting")
             elif code == CMD_GET:
                 with open(to_host(body.decode("latin-1")), "rb") as fh:
                     self.reply(ST_OK, fh.read())
