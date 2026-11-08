@@ -79,7 +79,7 @@ typedef long ssize_t;
  * "Version: ?" — which is what an icon-started agent looked like until now.
  * `used` keeps -Os from discarding a string nothing references. */
 static const char __attribute__((used)) verstag[] =
-    "$VER: amiagent " AMIAGENT_VERSION " (5.11.2026)";
+    "$VER: amiagent " AMIAGENT_VERSION " (9.11.2026)";
 
 #ifdef AMIAGENT_SSL
 #include <proto/amisslmaster.h>
