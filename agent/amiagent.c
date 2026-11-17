@@ -64,6 +64,8 @@ typedef long ssize_t;
 
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <sys/errno.h>
 #include <sys/time.h>
 
 #include <stdarg.h>
@@ -350,6 +352,7 @@ static int recv_all(int sock, UBYTE *buf, ULONG len)
         int r = sock_readable(sock, 120);
         if (r <= 0) return 0;
         got = recv(sock, (char *)buf, (int)(len > 0x7000 ? 0x7000 : len), 0);
+        if (got < 0 && Errno() == EWOULDBLOCK) continue;
         if (got <= 0) return 0;
         buf += got;
         len -= (ULONG)got;
@@ -378,6 +381,7 @@ static int send_all(int sock, const UBYTE *buf, ULONG len)
          * an hour into a RAWREAD run, 2026-11-05). */
         if (sock_writable(sock, 60) <= 0) return 0;
         put = send(sock, (char *)buf, (int)(len > 0x7000 ? 0x7000 : len), 0);
+        if (put < 0 && Errno() == EWOULDBLOCK) continue;
         if (put <= 0) return 0;
         buf += put;
         len -= (ULONG)put;
@@ -3755,6 +3759,9 @@ int main(void)
             calen = sizeof ca;
             cs = accept(listener, (struct sockaddr *)&ca, &calen);
             if (cs >= 0) {
+                /* Plaintext only; AmiSSL needs a blocking socket. */
+                LONG nb = 1;
+                IoctlSocket(cs, FIONBIO, (char *)&nb);
                 serve(cs, (const char *)Inet_NtoA(ca.sin_addr.s_addr));
                 CloseSocket(cs);
             }
