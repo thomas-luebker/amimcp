@@ -45,8 +45,12 @@ at these speeds.
 
 The Fast phases allocate `MEMF_FAST` explicitly — `MEMF_ANY` can land in Chip on
 a machine short of Fast and measure the chipset bus instead of the CPU. The Chip
-phases measure that bus deliberately, with 512 KB buffers, because there is only
-2 MB of Chip and the OS is already in it.
+phases measure that bus deliberately, with 512 KB buffers, because there is at
+most 2 MB of Chip and the OS is already in it. A machine with less free Chip
+gets the largest size that fits, halving down to 16 KB, and `chipsz` in the
+first output line says which; `benchrun.py` divides by it, so the result is
+still MB/s. Before 2026-11-21 the size was fixed, and a 1 MB Chip machine (the
+A2000, 982 KB free) skipped the Chip phases on every run.
 
 ## Results so far
 

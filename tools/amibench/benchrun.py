@@ -76,9 +76,13 @@ def measure(host: str, token: str, runs: int) -> list[dict]:
     # loser exits quietly — leaving the winner to answer every probe. A whole
     # settings sweep was once thrown away for want of this line.
     print("    %s" % a.ping().strip().replace("\n", " "))
+    # Compare the bytes, not just "is there a file": RAM:amibench lives until
+    # a reboot, so checking only for its presence kept running a stale binary
+    # after amibench.c changed (2026-11-21, the adaptive Chip size). 60 KB is
+    # a fraction of a second even on the slowest link in the fleet.
+    data = open(BINARY, "rb").read()
     rc, out = a.exec_command("List RAM: PAT amibench", timeout=30)
-    if "amibench" not in out:
-        data = open(BINARY, "rb").read()
+    if "amibench" not in out or a.read_file("RAM:amibench") != data:
         a.write_file("RAM:amibench", data)
         if a.read_file("RAM:amibench") != data:
             raise SystemExit("%s: amibench did not survive the copy" % host)
