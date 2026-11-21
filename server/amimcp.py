@@ -20,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -142,20 +143,31 @@ TOOLS = [
             "Write a file to the Amiga, creating or overwriting it. Use this to "
             "push a fixed Startup-Sequence, a config file, a script, or a "
             "cross-compiled binary. The parent drawer must already exist — "
-            "create it with amiga_shell 'MakeDir' first if needed."
+            "create it with amiga_shell 'MakeDir' first if needed. Files of any "
+            "size: past 1 MiB they go in checksummed pieces (amiagent 0.16+; an "
+            "older agent takes up to 16 MiB in one piece). For a large file on "
+            "this Mac, pass local_path instead of content."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Destination AmigaDOS path."},
                 "content": {"type": "string", "description": "File contents."},
+                "local_path": {
+                    "type": "string",
+                    "description": "Upload this file from the Mac instead of 'content'.",
+                },
                 "encoding": {
                     "type": "string",
                     "enum": ["text", "base64"],
                     "description": "How 'content' is encoded. Default 'text'. Use 'base64' for binaries.",
                 },
+                "append": {
+                    "type": "boolean",
+                    "description": "Append to the file (created if missing) instead of replacing it. Needs amiagent 0.16+.",
+                },
             },
-            "required": ["path", "content"],
+            "required": ["path"],
         },
     },
     {
@@ -637,12 +649,25 @@ def tool_read_file(ami: Amiga, args: dict) -> list[dict]:
 def tool_write_file(ami: Amiga, args: dict) -> list[dict]:
     path = args["path"]
     encoding = args.get("encoding", "text")
-    if encoding == "base64":
+    if args.get("local_path"):
+        with open(os.path.expanduser(args["local_path"]), "rb") as fh:
+            data = fh.read()
+    elif "content" not in args:
+        raise AmigaError("give either 'content' or 'local_path'")
+    elif encoding == "base64":
         data = base64.b64decode(args["content"])
     else:
         data = args["content"].encode("latin-1", "replace")
-    ami.write_file(path, data)
-    return [{"type": "text", "text": f"Wrote {len(data)} bytes to {path}."}]
+    start = time.monotonic()
+    if args.get("append"):
+        size = ami.append_file(path, data)
+        verb = f"Appended {len(data)} bytes to {path} (now {size} bytes)"
+    else:
+        ami.write_file(path, data)
+        verb = f"Wrote {len(data)} bytes to {path}"
+    secs = time.monotonic() - start
+    rate = f", {len(data) / secs / 1024:.0f} KB/s" if secs > 1 else ""
+    return [{"type": "text", "text": f"{verb} in {secs:.1f} s{rate}."}]
 
 
 def tool_list_dir(ami: Amiga, args: dict) -> list[dict]:

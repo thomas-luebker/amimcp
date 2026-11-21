@@ -28,9 +28,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from amiga import (  # noqa: E402
     CMD_ABANDON, CMD_AUTH, CMD_BREAK, CMD_EXEC, CMD_GET, CMD_GETRANGE, CMD_INFO, CMD_INPUT,
-    CMD_LIST, CMD_REBOOT, CMD_HASH, CMD_PING, CMD_POINTER, CMD_PUT, CMD_SCREENS, CMD_SHOT, HDRLEN,
+    CMD_LIST, CMD_PUTRANGE, CMD_REBOOT, CMD_HASH, CMD_PING, CMD_POINTER, CMD_PUT, CMD_SCREENS, CMD_SHOT, HDRLEN,
     IN_BUTTON, IN_CLICK, IN_HOME, IN_KEY, IN_MOVE, IN_RMOVE, IN_SCRIPT,
-    INS_WAIT, IN_TEXT, MAGIC, SHOT_CHUNKY, SHOT_RGB24, ST_AUTH, ST_ERR, ST_OK,
+    INS_WAIT, IN_TEXT, MAGIC, PUTRANGE_APPEND, SHOT_CHUNKY, SHOT_RGB24, ST_AUTH, ST_ERR, ST_OK,
 )
 
 # Every input event the fake agent is asked to inject, so tests can assert on
@@ -40,6 +40,8 @@ TRUECOLOR = False
 # Set the unused high bits of every chunky pixel, as an agent before 0.13.2
 # did on a planar screen shallower than 8 (uncleared temp bitmap planes).
 SHOT_NOISE = False
+# Answer PUTRANGE with "unknown command", as every agent before 0.16.0 does.
+NO_PUTRANGE = False
 
 ROOT = "/tmp/fakeamiga"
 TOKEN = ""
@@ -393,6 +395,24 @@ class Handler(socketserver.BaseRequestHandler):
                 with open(host, "wb") as fh:
                     fh.write(body[2 + plen :])
                 self.reply(ST_OK)
+            elif code == CMD_PUTRANGE and not NO_PUTRANGE:
+                import zlib
+                offset, plen = struct.unpack(">IH", body[:6])
+                host = to_host(body[6 : 6 + plen].decode("latin-1"))
+                data = body[6 + plen :]
+                if offset == 0 or (offset == PUTRANGE_APPEND and not os.path.exists(host)):
+                    os.makedirs(os.path.dirname(host), exist_ok=True)
+                    open(host, "wb").close()
+                size = os.path.getsize(host)
+                pos = size if offset == PUTRANGE_APPEND else offset
+                if pos > size:
+                    raise ValueError(f"offset {offset} is past the end ({size} bytes)")
+                with open(host, "r+b") as fh:
+                    fh.seek(pos)
+                    fh.write(data)
+                pos += len(data)
+                self.reply(ST_OK, struct.pack(">III", pos, os.path.getsize(host),
+                                              zlib.adler32(data) & 0xFFFFFFFF))
             elif code == CMD_LIST:
                 self.reply(ST_OK, self.listing(body.decode("latin-1")))
             else:

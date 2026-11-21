@@ -22,6 +22,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "server"))
 sys.path.insert(0, HERE)
 
+import amiga  # noqa: E402
 import amimcp  # noqa: E402
 import fake_agent  # noqa: E402
 import png  # noqa: E402
@@ -100,6 +101,66 @@ class TestWireProtocol(Base):
         self.assertEqual(self.ami.read_range("Work:range.bin", 1000, 100), payload[1000:1100])
         self.assertEqual(self.ami.read_range("Work:range.bin", 4000, 8192), payload[4000:])
         self.assertEqual(self.ami.read_range("Work:range.bin", 4096, 512), b"")
+
+    def test_chunked_write_roundtrip(self):
+        # More than one chunk, so this goes through PUTRANGE pieces.
+        payload = os.urandom(50_000)
+        seen = []
+        self.ami.write_file("Work:chunked.bin", payload, chunk=4096,
+                            progress=lambda d, t: seen.append(d))
+        self.assertEqual(self.ami.read_file("Work:chunked.bin"), payload)
+        self.assertEqual(seen[-1], len(payload))
+        self.assertEqual(len(seen), 13)
+
+    def test_chunked_write_replaces_a_longer_file(self):
+        self.ami.write_file("Work:shrink.bin", b"x" * 20_000, chunk=4096)
+        self.ami.write_file("Work:shrink.bin", b"y" * 9_000, chunk=4096)
+        self.assertEqual(self.ami.read_file("Work:shrink.bin"), b"y" * 9_000)
+
+    def test_append_file(self):
+        self.ami.write_file("Work:app.txt", b"one\n")
+        self.assertEqual(self.ami.append_file("Work:app.txt", b"two\n"), 8)
+        big = os.urandom(10_000)
+        self.assertEqual(self.ami.append_file("Work:app.txt", big, chunk=3000), 10_008)
+        self.assertEqual(self.ami.read_file("Work:app.txt"), b"one\ntwo\n" + big)
+
+    def test_append_creates_missing_file(self):
+        self.ami.append_file("Work:new-append.txt", b"abc")
+        self.assertEqual(self.ami.read_file("Work:new-append.txt"), b"abc")
+
+    def test_write_range_past_end_is_refused(self):
+        self.ami.write_file("Work:hole.bin", b"1234")
+        with self.assertRaises(AmigaError) as ctx:
+            self.ami.write_range("Work:hole.bin", 100, b"x")
+        self.assertIn("past the end", str(ctx.exception))
+
+    def test_oversized_frame_is_refused_before_sending(self):
+        with self.assertRaises(AmigaError) as ctx:
+            self.ami._request(amiga.CMD_PUT, b"\0" * (amiga.MAXFRAME + 1))
+        self.assertIn("frame limit", str(ctx.exception))
+
+    def test_old_agent_falls_back_to_put_when_it_fits(self):
+        fake_agent.NO_PUTRANGE = True
+        try:
+            payload = os.urandom(20_000)
+            self.ami.write_file("Work:oldagent.bin", payload, chunk=4096)
+            self.assertEqual(self.ami.read_file("Work:oldagent.bin"), payload)
+            with self.assertRaises(AmigaError) as ctx:
+                self.ami.append_file("Work:oldagent.bin", b"more")
+            self.assertIn("0.16.0", str(ctx.exception))
+        finally:
+            fake_agent.NO_PUTRANGE = False
+
+    def test_old_agent_refuses_beyond_one_frame_and_writes_nothing(self):
+        fake_agent.NO_PUTRANGE = True
+        try:
+            with self.assertRaises(AmigaError) as ctx:
+                self.ami.write_file("Work:toobig.bin", b"\0" * (amiga.MAXFRAME + 1))
+            self.assertIn("PUTRANGE", str(ctx.exception))
+            with self.assertRaises(AmigaError):
+                self.ami.read_file("Work:toobig.bin")
+        finally:
+            fake_agent.NO_PUTRANGE = False
 
     def test_list_dir_sorts_dirs_first(self):
         entries = self.ami.list_dir("SYS:")
@@ -493,6 +554,19 @@ class TestMCP(Base):
         })
         self.assertFalse(res["isError"])
         self.assertEqual(self.ami.read_file("Work:bin.dat"), payload)
+
+    def test_write_file_tool_local_path_and_append(self):
+        local = os.path.join(self.root, "..", "upload-src.bin")
+        payload = os.urandom(3000)
+        with open(local, "wb") as fh:
+            fh.write(payload)
+        res = self.tool("amiga_write_file", {"path": "Work:up.bin", "local_path": local})
+        self.assertFalse(res["isError"])
+        res = self.tool("amiga_write_file", {"path": "Work:up.bin", "content": "tail",
+                                             "append": True})
+        self.assertFalse(res["isError"])
+        self.assertIn("now 3004 bytes", res["content"][0]["text"])
+        self.assertEqual(self.ami.read_file("Work:up.bin"), payload + b"tail")
 
     def test_list_dir_tool(self):
         res = self.tool("amiga_list_dir", {"path": "SYS:"})

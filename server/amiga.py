@@ -15,6 +15,7 @@ import ssl
 import struct
 import tempfile
 import time
+import zlib
 from dataclasses import dataclass
 
 # Trust-on-first-use fingerprints of each agent's self-signed certificate.
@@ -44,6 +45,7 @@ CMD_DEVICES = 0x15
 CMD_RAWREAD = 0x16
 CMD_ABANDON = 0x17
 CMD_REBOOT = 0x18
+CMD_PUTRANGE = 0x19
 CMD_UIACT = 0x0E
 CMD_MENUS = 0x0F
 CMD_AUTH = 0x10
@@ -82,6 +84,15 @@ RAWKEYS = {
     "f1": 0x50, "f2": 0x51, "f3": 0x52, "f4": 0x53, "f5": 0x54,
     "f6": 0x55, "f7": 0x56, "f8": 0x57, "f9": 0x58, "f10": 0x59,
 }
+
+# CMD_PUTRANGE offset meaning "at the end of the file" (agent/proto.h).
+PUTRANGE_APPEND = 0xFFFFFFFF
+
+# Piece size for uploads larger than this. Well under the 16 MiB frame limit
+# on purpose: on the A2000 (X-Surf-100) single 4 MB requests sometimes stalled
+# for minutes while 1 MB pieces went through, and a failed piece is cheap to
+# send again because PUTRANGE writes at an explicit offset.
+UPLOAD_CHUNK = 1024 * 1024
 
 ST_OK = 0x00
 ST_ERR = 0x01
@@ -277,7 +288,28 @@ class Amiga:
                 if self.token:
                     sock.sendall(_frame(CMD_AUTH, self.token.encode("latin-1")))
                     self._read_response(sock)
-                sock.sendall(_frame(code, payload))
+                if len(payload) > MAXFRAME:
+                    # The agent drops such a frame without answering, which
+                    # reaches us as a bare BrokenPipeError halfway through
+                    # sendall. Say what actually went wrong instead.
+                    raise AmigaError(
+                        f"request payload of {len(payload)} bytes exceeds the "
+                        f"{MAXFRAME >> 20} MiB frame limit"
+                    )
+                try:
+                    sock.sendall(_frame(code, payload))
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    # The agent may have answered before closing — an error
+                    # frame explaining the refusal can still be in our buffer.
+                    try:
+                        return self._read_response(sock)
+                    except (OSError, AmigaUnreachable):
+                        pass
+                    raise AmigaUnreachable(
+                        f"the agent closed the connection while we were still "
+                        f"sending ({e.__class__.__name__}) — it refused the "
+                        "request without an answer, or the link dropped"
+                    ) from e
                 return self._read_response(sock)
             except socket.timeout as e:
                 raise AmigaUnreachable(
@@ -390,9 +422,126 @@ class Amiga:
         return self._request(CMD_RAWREAD, payload + device.encode("latin-1"),
                              timeout=max(self.timeout, 120.0))
 
-    def write_file(self, path: str, data: bytes) -> None:
+    def write_range(self, path: str, offset: int, data: bytes) -> tuple[int, int]:
+        """Write `data` into a file at `offset` (PUTRANGE, agent 0.16+).
+
+        `offset` 0 creates or truncates the file, PUTRANGE_APPEND appends
+        (creating the file if it is missing), any other offset must lie within
+        the file. Returns (position after the write, file size). The agent's
+        Adler-32 of what it received and the position it reached are checked
+        here, so a piece that arrived short or landed elsewhere raises rather
+        than leaving a quietly corrupt file.
+        """
+        if len(data) > UPLOAD_CHUNK * 8:
+            raise AmigaError("write_range takes at most 8 MiB per call; use write_file or append_file")
         p = path.encode("latin-1")
-        self._request(CMD_PUT, struct.pack(">H", len(p)) + p + data, timeout=max(self.timeout, 120.0))
+        body = self._request(
+            CMD_PUTRANGE, struct.pack(">IH", offset, len(p)) + p + data,
+            timeout=max(self.timeout, 120.0),
+        )
+        if len(body) < 12:
+            raise AmigaUnreachable("truncated PUTRANGE response")
+        pos, size, adler = struct.unpack(">III", body[:12])
+        want = zlib.adler32(data) & 0xFFFFFFFF
+        if adler != want:
+            raise AmigaError(
+                f"PUTRANGE checksum mismatch on {path} at {offset}: the agent "
+                f"received Adler-32 {adler:08x}, we sent {want:08x}"
+            )
+        if offset != PUTRANGE_APPEND and pos != offset + len(data):
+            raise AmigaError(
+                f"PUTRANGE on {path} ended at {pos}, expected {offset + len(data)}"
+            )
+        return pos, size
+
+    def _has_putrange(self, path: str) -> bool:
+        """Probe for PUTRANGE by creating `path` empty — which every chunked
+        upload is about to do anyway. Older agents answer "unknown command"."""
+        try:
+            self.write_range(path, 0, b"")
+            return True
+        except AmigaError as e:
+            if "unknown command" in str(e):
+                return False
+            raise
+
+    def _upload_chunks(self, path: str, data: bytes, start: int, chunk: int,
+                       progress=None) -> int:
+        """Send `data` as PUTRANGE pieces at explicit offsets from `start`.
+
+        Each piece names its own offset, so one that stalled or dropped is
+        simply sent again (twice at most) without a gap or a duplicate.
+        Returns the file size the agent reported after the last piece.
+        """
+        size = start
+        for done in range(0, len(data), chunk):
+            piece = data[done:done + chunk]
+            for attempt in range(3):
+                try:
+                    _, size = self.write_range(path, start + done, piece)
+                    break
+                except AmigaUnreachable:
+                    if attempt == 2:
+                        raise
+                    time.sleep(2.0)
+            if progress:
+                progress(done + len(piece), len(data))
+        return size
+
+    def write_file(self, path: str, data: bytes, chunk: int = UPLOAD_CHUNK,
+                   progress=None) -> None:
+        """Create or overwrite `path` with `data`, any size.
+
+        Up to `chunk` bytes go as one PUT, as always. Larger data goes as
+        PUTRANGE pieces of `chunk` bytes (agent 0.16+), each checked against
+        the agent's Adler-32, and the final size is checked against the agent's
+        own count. Against an older agent, data that still fits one frame falls
+        back to a single PUT; anything larger raises rather than writing part
+        of the file.
+        """
+        p = path.encode("latin-1")
+        single = struct.pack(">H", len(p)) + p
+        if len(data) <= chunk:
+            self._request(CMD_PUT, single + data, timeout=max(self.timeout, 120.0))
+            return
+        if not self._has_putrange(path):
+            if len(single) + len(data) <= MAXFRAME:
+                self._request(CMD_PUT, single + data, timeout=max(self.timeout, 120.0))
+                return
+            raise AmigaError(
+                f"{len(data)} bytes do not fit one {MAXFRAME >> 20} MiB frame and this "
+                "amiagent has no PUTRANGE (needs 0.16.0+). Upgrade the agent, or upload "
+                "parts and Join them on the Amiga. Nothing was written."
+            )
+        try:
+            size = self._upload_chunks(path, data, 0, chunk, progress)
+        except (AmigaError, AmigaUnreachable) as e:
+            raise type(e)(f"upload of {path} stopped part-way, so the file on the "
+                          f"Amiga is incomplete: {e}") from e
+        if size != len(data):
+            raise AmigaError(f"{path} is {size} bytes on the Amiga after upload, expected {len(data)}")
+
+    def append_file(self, path: str, data: bytes, chunk: int = UPLOAD_CHUNK,
+                    progress=None) -> int:
+        """Append `data` to `path` (created if missing); returns the new size.
+
+        The first piece is an append; the rest go at the offsets it reported,
+        so a retried piece never lands twice. Needs agent 0.16+.
+        """
+        first = data[:chunk]
+        try:
+            pos, size = self.write_range(path, PUTRANGE_APPEND, first)
+        except AmigaError as e:
+            if "unknown command" in str(e):
+                raise AmigaError("this amiagent has no PUTRANGE, so it cannot append (needs 0.16.0+)") from e
+            raise
+        if progress:
+            progress(len(first), len(data))
+        if len(data) > len(first):
+            size = self._upload_chunks(path, data[len(first):], pos, chunk,
+                                       (lambda d, t: progress(d + len(first), len(data)))
+                                       if progress else None)
+        return size
 
     def list_dir(self, path: str) -> list[DirEntry]:
         text = self._request(CMD_LIST, path.encode("latin-1")).decode("latin-1", "replace")

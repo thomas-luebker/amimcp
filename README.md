@@ -398,9 +398,12 @@ and about 7 seconds on the wire; the PNG that reaches Claude is around 850 KiB.
   preference to `C:sgrab` when it exists: yelworC's IMP screenshot wrapper takes
   over the plain name and would answer our argument line with a requester.
 - **One command at a time**, one connection at a time.
-- **16 MiB per frame.** A single request/response is capped at 16 MiB; the fleet
-  clients stream larger files past it in pieces (chunked upload via `Join`,
-  download via `GETRANGE`). The MCP file tools are one frame each.
+- **16 MiB per frame.** A single request/response is capped at 16 MiB. Larger
+  files go in pieces: `amiga_write_file` / `write_file` upload past 1 MiB as
+  checksummed `PUTRANGE` pieces (agent 0.16+; an older agent takes up to 16 MiB
+  in one `PUT` and refuses beyond), downloads use `GETRANGE`. The Swift
+  amifleet client still uploads big files as parts plus `Join`, and
+  `amiga_read_file` is one frame.
 
 ## How it works
 
