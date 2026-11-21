@@ -99,6 +99,19 @@
 #define CMD_ABANDON 0x17  /* give up on a running EXEC: it keeps running and the
                          * slot is free again. Empty request; text reply. */
 #define CMD_REBOOT 0x18   /* ColdReboot after replying. Empty request. */
+#define CMD_PUTRANGE 0x19 /* the upload counterpart to GETRANGE: write a byte
+                         * range of a file. Payload: u32 offset + u16 pathlen +
+                         * path + data. Offset 0 creates or truncates the file
+                         * (like PUT); PUTRANGE_APPEND appends at the end,
+                         * creating the file if it is missing; any other offset
+                         * must lie within the file (no holes) and overwrites
+                         * from there. Streams to disk like PUT. Reply: u32
+                         * position after the write, u32 file size, u32
+                         * Adler-32 of the data received. The body is always
+                         * drained before an error reply, so the client sees
+                         * the reason rather than a broken pipe. Lets a client
+                         * upload a file past the 16 MiB frame limit. */
+#define PUTRANGE_APPEND 0xFFFFFFFFUL
 
 /* CMD_SHOT payload is optional, and omitting it means "the whole frontmost
  * screen" exactly as before:
@@ -175,11 +188,14 @@
  * already far beyond what a classic Amiga wants in one bite, and the cap is
  * what stops a bad length field from turning into a wild AllocVec. */
 #define AMI_MAXFRAME (16UL * 1024UL * 1024UL)
+/* A larger length is dropped in read_frame before any reply goes out, so a
+ * client still sending the body sees EPIPE/ECONNRESET, not an error frame -
+ * that is how a 42 MB PUT failed on 2026-11-21. Use PUTRANGE in pieces. */
 
 /* Screenshot payload formats. */
 #define SHOT_CHUNKY 1   /* palette + 1 byte/pixel */
 #define SHOT_RGB24  2   /* 3 bytes/pixel, no palette */
 
-#define AMIAGENT_VERSION "0.15.0"
+#define AMIAGENT_VERSION "0.16.0"
 
 #endif /* AMIMCP_PROTO_H */

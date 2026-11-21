@@ -30,7 +30,10 @@ offset  size  field
 ```
 
 Header is 12 bytes. `length` is capped at 16 MiB by both sides; a larger value
-is a protocol error and the connection is dropped.
+is a protocol error and the connection is dropped **without a reply** — a
+client still sending the body sees a broken pipe, which is exactly how a 42 MB
+`PUT` failed on 2026-11-21. Files past the cap go up in pieces with `PUTRANGE`
+and come down in pieces with `GETRANGE`.
 
 **One request per connection.** The client connects, sends one request, reads
 one response, closes. This keeps the agent a trivial single-threaded accept
@@ -66,6 +69,7 @@ exception: it precedes the real request on the same connection.
 | 0x16 | `RAWREAD` | `unit`, `flags`, `offset hi`, `offset lo`, `length` (u32 each) + device name | exactly `length` raw bytes |
 | 0x17 | `ABANDON` | *(empty)*                          | Text. The running `EXEC` is left running and the slot is free; up to 8 at once |
 | 0x18 | `REBOOT` | *(empty)*                           | Text, sent before `ColdReboot()` about 2 s later |
+| 0x19 | `PUTRANGE` | `offset` (u32) + `pathlen` (u16) + path + file bytes | `pos`, `size`, `adler32` (u32 each) — see below |
 
 Text payloads are **not** NUL-terminated; the frame length delimits them.
 
@@ -81,12 +85,45 @@ is how the fleet drives ARexx-aware apps (editors, DOpus, comms, players).
 ports `AREXX` can `ADDRESS`, so a caller can discover what is scriptable right
 now. `GETRANGE` is `GET` with an `offset`+`length` prefix, letting a client
 stream a file past the 16 MiB frame limit in pieces (the download counterpart to
-chunked upload via `Join`). A range that runs past the end of the file is
+`PUTRANGE`). A range that runs past the end of the file is
 clamped: the reply carries only the bytes that exist, so **a reply shorter than
 `length` means end of file** (and an `offset` exactly at the end gets an empty
 reply). Agents before 0.13.2 announced the full `length` and then sent less,
 leaving the client waiting mid-frame; size the file from `LIST` first if you
 must talk to one of those.
+
+## `PUTRANGE` (0.16)
+
+The upload counterpart to `GETRANGE`: `PUT` with a `u32 offset` in front,
+streamed to disk the same way (never held in RAM), so a client can send a file
+of any size as a run of requests that each stay far below the frame cap.
+
+| `offset` | Opens the file | Writes at |
+|---|---|---|
+| `0` | `MODE_NEWFILE` — created or truncated, like `PUT` | the start |
+| `0xFFFFFFFF` | `MODE_OLDFILE`, or `MODE_NEWFILE` when it does not exist | the end (append) |
+| anything else | `MODE_OLDFILE`; must be ≤ the current size (no holes) | `offset`, overwriting |
+
+The reply is three `u32`s: the position after the write, the file size, and
+the **Adler-32** (zlib's) of the bytes the agent received. A client checks the
+position against `offset + length` and the checksum against its own, so a piece
+that arrived short or landed in the wrong place is an error, not a quietly
+corrupt file. Because every piece after the first names its own offset, one
+that stalled can simply be sent again.
+
+An error before or during the write (the file cannot be opened, the offset lies
+past the end, the disk is full) is answered **after the body has been read to
+the end**, so the client gets the reason instead of a broken pipe.
+
+A `PUTRANGE` with no data at offset 0 creates an empty file — the cheap probe
+the Mac client uses: an agent older than 0.16.0 answers `unknown command`.
+
+The client (`write_file`) sends anything up to 1 MiB as one `PUT`, as before,
+and anything larger as 1 MiB `PUTRANGE` pieces. Against an older agent it
+falls back to one `PUT` while the file fits a frame and refuses — writing
+nothing — beyond that. 1 MiB rather than something closer to the cap because
+single 4 MB requests sometimes stalled for minutes on the A2000's X-Surf-100,
+and per-request overhead is a few milliseconds on plain TCP.
 
 ## `DEVICES` and `RAWREAD` (0.14)
 

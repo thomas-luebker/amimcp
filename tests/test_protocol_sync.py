@@ -66,12 +66,17 @@ class TestProtocolSync(unittest.TestCase):
     def test_command_codes_match(self):
         for name in ("PING", "EXEC", "GET", "PUT", "LIST", "INFO", "SHOT", "INPUT",
                      "BREAK", "SCREENS", "POINTER", "HASH", "AUTH",
-                     "ABANDON", "REBOOT"):
+                     "ABANDON", "REBOOT", "GETRANGE", "PUTRANGE"):
             self.assertEqual(
                 self.c[f"CMD_{name}"],
                 getattr(amiga, f"CMD_{name}"),
                 f"CMD_{name} differs between proto.h and amiga.py",
             )
+
+    def test_putrange_append_offset_matches(self):
+        m = re.search(r"#define PUTRANGE_APPEND\s+0x([0-9A-Fa-f]+)UL", self.src)
+        self.assertIsNotNone(m)
+        self.assertEqual(int(m.group(1), 16), amiga.PUTRANGE_APPEND)
 
     def test_status_codes_match(self):
         for name in ("OK", "ERR", "AUTH"):
@@ -93,7 +98,8 @@ class TestProtocolSync(unittest.TestCase):
 
     def test_every_command_constant_is_handled_by_the_daemon(self):
         src = read(os.path.join(HERE, "..", "agent", "amiagent.c"))
-        for name in ("PING", "EXEC", "GET", "PUT", "LIST", "INFO", "SHOT", "INPUT", "BREAK"):
+        for name in ("PING", "EXEC", "GET", "PUT", "LIST", "INFO", "SHOT", "INPUT", "BREAK",
+                     "PUTRANGE"):
             self.assertIn(f"case CMD_{name}:", src, f"amiagent.c never handles CMD_{name}")
         self.assertIn("code == CMD_AUTH", src, "amiagent.c never handles CMD_AUTH")
 

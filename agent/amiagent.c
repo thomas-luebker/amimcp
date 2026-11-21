@@ -79,7 +79,7 @@ typedef long ssize_t;
  * "Version: ?" — which is what an icon-started agent looked like until now.
  * `used` keeps -Os from discarding a string nothing references. */
 static const char __attribute__((used)) verstag[] =
-    "$VER: amiagent " AMIAGENT_VERSION " (9.11.2026)";
+    "$VER: amiagent " AMIAGENT_VERSION " (21.11.2026)";
 
 #ifdef AMIAGENT_SSL
 #include <proto/amisslmaster.h>
@@ -1368,6 +1368,128 @@ static int do_put(int sock, const UBYTE *head, ULONG headlen, ULONG total)
 
     if (!ok) return send_err(sock, "write failed (disk full or connection lost)");
     return send_resp(sock, ST_OK, NULL, 0);
+}
+
+/* Adler-32, as zlib computes it, so the client can check with zlib.adler32.
+ * Two adds per byte; the modulo runs once per 5552 bytes (the most that
+ * cannot overflow 32 bits), so it costs next to nothing even on a 68000. */
+static void adler_update(ULONG *a, ULONG *b, const UBYTE *p, ULONG n)
+{
+    ULONG s1 = *a, s2 = *b;
+    while (n) {
+        ULONG k = n < 5552 ? n : 5552;
+        n -= k;
+        while (k--) { s1 += *p++; s2 += s1; }
+        s1 %= 65521UL;
+        s2 %= 65521UL;
+    }
+    *a = s1; *b = s2;
+}
+
+/* Swallow what is left of a request body so an error reply can be read: the
+ * client is still in sendall(), and closing on it turns our explanation into
+ * a broken pipe on its side. */
+static void drain(int sock, ULONG remaining)
+{
+    while (remaining) {
+        ULONG want = remaining > IOBUF ? IOBUF : remaining;
+        if (!recv_all(sock, g_io, want)) return;
+        remaining -= want;
+    }
+}
+
+/* PUTRANGE: u32 offset + u16 pathlen + path + data. The upload counterpart to
+ * GETRANGE, for files past the 16 MiB frame limit: the client sends the file
+ * as a run of requests, each well under the limit. Offset 0 starts the file
+ * anew (MODE_NEWFILE, like PUT), PUTRANGE_APPEND appends (creating the file
+ * if needed), any other offset must lie inside the file. Streams to disk
+ * exactly like PUT. Reply: u32 position after the write, u32 file size,
+ * u32 Adler-32 of the bytes received - enough for the client to know the
+ * piece landed where it meant and that nothing was lost on the way. */
+static int do_putrange(int sock, const UBYTE *head, ULONG headlen, ULONG total)
+{
+    ULONG offset, remaining, have, pos, size;
+    ULONG s1 = 1, s2 = 0;
+    UWORD pathlen;
+    char *path;
+    BPTR fh;
+    int ok = 1;
+    UBYTE reply[12];
+    char msg[300];
+
+    if (headlen < 6) { drain(sock, total - headlen); return send_err(sock, "PUTRANGE payload too short"); }
+    offset = get_be32(head);
+    pathlen = (UWORD)((head[4] << 8) | head[5]);
+    if ((ULONG)pathlen + 6 > headlen) {
+        drain(sock, total - headlen);
+        return send_err(sock, "PUTRANGE path exceeds prefetched header");
+    }
+    path = dup_cstr(head + 6, pathlen);
+    if (!path) { drain(sock, total - headlen); return send_err(sock, "out of memory"); }
+
+    if (offset == 0) {
+        fh = Open((STRPTR)path, MODE_NEWFILE);
+    } else {
+        fh = Open((STRPTR)path, MODE_OLDFILE);
+        if (!fh && offset == PUTRANGE_APPEND && IoErr() == ERROR_OBJECT_NOT_FOUND)
+            fh = Open((STRPTR)path, MODE_NEWFILE);
+    }
+    if (!fh) {
+        sprintf(msg, "cannot open \"%s\" for writing (DOS error %ld)", path, (long)IoErr());
+        FreeVec(path);
+        drain(sock, total - headlen);
+        return send_err(sock, msg);
+    }
+
+    /* Seek() answers the previous position, so end-then-back sizes the file. */
+    Seek(fh, 0, OFFSET_END);
+    size = (ULONG)Seek(fh, 0, OFFSET_CURRENT);
+    if (offset == PUTRANGE_APPEND) {
+        pos = size;
+    } else if (offset > size) {
+        sprintf(msg, "offset %lu is past the end of \"%s\" (%lu bytes)",
+                (unsigned long)offset, path, (unsigned long)size);
+        Close(fh); FreeVec(path);
+        drain(sock, total - headlen);
+        return send_err(sock, msg);
+    } else {
+        pos = offset;
+        Seek(fh, (LONG)pos, OFFSET_BEGINNING);
+    }
+    say("putrange: %s at %lu\n", path, (unsigned long)pos);
+    FreeVec(path);
+
+    /* Same streaming as PUT. A failed Write stops writing but keeps reading,
+     * so the client is not left mid-sendall when the error comes back. */
+    have = headlen - (pathlen + 6);
+    if (have) {
+        adler_update(&s1, &s2, head + 6 + pathlen, have);
+        if (Write(fh, (APTR)(head + 6 + pathlen), (LONG)have) != (LONG)have) ok = 0;
+        else pos += have;
+    }
+    remaining = total - headlen;
+    while (remaining) {
+        ULONG want = remaining > IOBUF ? IOBUF : remaining;
+        if (!recv_all(sock, g_io, want)) { Close(fh); return 0; }
+        remaining -= want;
+        if (!ok) continue;
+        adler_update(&s1, &s2, g_io, want);
+        if (Write(fh, g_io, (LONG)want) != (LONG)want) ok = 0;
+        else pos += want;
+    }
+    Seek(fh, 0, OFFSET_END);
+    size = (ULONG)Seek(fh, 0, OFFSET_CURRENT);
+    Close(fh);
+
+    if (!ok) {
+        sprintf(msg, "write failed at byte %lu (DOS error %ld, disk full?)",
+                (unsigned long)pos, (long)IoErr());
+        return send_err(sock, msg);
+    }
+    put_be32(reply, pos);
+    put_be32(reply + 4, size);
+    put_be32(reply + 8, (s2 << 16) | s1);
+    return send_resp(sock, ST_OK, reply, 12);
 }
 
 static void fmt_protection(ULONG prot, char *out)
@@ -3155,6 +3277,7 @@ static const char *cmd_name(UBYTE code)
     case CMD_RAWREAD:   return "RAWREAD";
     case CMD_ABANDON:   return "ABANDON";
     case CMD_REBOOT:    return "REBOOT";
+    case CMD_PUTRANGE:  return "PUTRANGE";
     default:          return "?";
     }
 }
@@ -3183,6 +3306,12 @@ static void board_begin(UBYTE code, const UBYTE *body, ULONG got,
         if (got >= 2) {
             ULONG pl = ((ULONG)body[0] << 8) | body[1];
             if (pl + 2 <= got) { txt = body + 2; n = pl; }
+        }
+        break;
+    case CMD_PUTRANGE:                   /* u32 offset + u16 pathlen + path + data */
+        if (got >= 6) {
+            ULONG pl = ((ULONG)body[4] << 8) | body[5];
+            if (pl + 6 <= got) { txt = body + 6; n = pl; }
         }
         break;
     }
@@ -3287,8 +3416,9 @@ static void serve(int sock, const char *client)
             break;
         }
 
-        /* Every command except PUT fits its payload in the prefetch. */
-        if (code != CMD_PUT && len > got) {
+        /* Every command except PUT and PUTRANGE fits its payload in the
+         * prefetch. */
+        if (code != CMD_PUT && code != CMD_PUTRANGE && len > got) {
             send_err(sock, "payload larger than the 8 KiB command limit");
             break;
         }
@@ -3317,6 +3447,7 @@ static void serve(int sock, const char *client)
         case CMD_EXEC: do_exec(sock, body, len); break;
         case CMD_GET:  do_get(sock, body, len); break;
         case CMD_PUT:  do_put(sock, body, got, len); break;
+        case CMD_PUTRANGE: do_putrange(sock, body, got, len); break;
         case CMD_LIST: do_list(sock, body, len); break;
         case CMD_INFO: do_info(sock); break;
         case CMD_SHOT: do_shot(sock, body, len); break;
